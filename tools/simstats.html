@@ -1,0 +1,36 @@
+<!doctype html><meta charset="utf-8"><body><script type="module">
+// Debug page: runs the ocean simulation once and reads back statistics (wave height, Jacobian).
+import { OceanSimulation } from '../src/ocean.js';
+const q = new URLSearchParams(location.search);
+const adapter = await navigator.gpu.requestAdapter();
+const device = await adapter.requestDevice();
+const sim = new OceanSimulation(device, { N: 256, lengths: [256, 48, 9] });
+sim.setParams({ windSpeed: +(q.get('wind') || 9), choppy: +(q.get('choppy') || 1.15) });
+const enc = device.createCommandEncoder();
+sim.update(enc, 20, 1 / 60);
+const N = 256, C = 3, bytes = N * N * C * 16;
+const rbA = device.createBuffer({ size: bytes, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+const rbB = device.createBuffer({ size: bytes, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+enc.copyBufferToBuffer(sim.bufA[0], 0, rbA, 0, bytes);
+enc.copyBufferToBuffer(sim.bufB[0], 0, rbB, 0, bytes);
+device.queue.submit([enc.finish()]);
+await rbA.mapAsync(GPUMapMode.READ); await rbB.mapAsync(GPUMapMode.READ);
+const A = new Float32Array(rbA.getMappedRange()), B = new Float32Array(rbB.getMappedRange());
+const lam = sim.params.choppy, out = [];
+let hsum = new Float64Array(N * N);
+for (let c = 0; c < C; c++) {
+  let h2 = 0, hmax = 0, jmin = 9, fold = 0, slope2 = 0, imagLeak = 0;
+  for (let i = 0; i < N * N; i++) {
+    const o = (c * N * N + i) * 4;
+    const h = A[o + 1], Dxx = A[o + 3], Dzz = B[o + 2], Dxz = B[o + 3];
+    hsum[i] += h;
+    h2 += h * h; hmax = Math.max(hmax, Math.abs(h));
+    slope2 += B[o] ** 2 + B[o + 1] ** 2;
+    const J = (1 + lam * Dxx) * (1 + lam * Dzz) - (lam * Dxz) ** 2;
+    jmin = Math.min(jmin, J); if (J < sim.params.foamThreshold) fold++;
+  }
+  out.push({ cascade: c, Hs: 4 * Math.sqrt(h2 / (N * N)), hmax, rmsSlope: Math.sqrt(slope2 / (N * N)), Jmin: jmin, foamFrac: fold / (N * N) });
+}
+document.body.textContent = JSON.stringify(out, null, 1);
+window.__done = true;
+</script>

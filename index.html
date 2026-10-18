@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WebGPU Ocean</title>
+<link rel="icon" href="data:,">
+<style>
+  :root { color-scheme: dark; --panel: rgba(12, 16, 24, 0.62); --text: #e8ecf2; --dim: #9aa6b8; --accent: #ffb26b; }
+  html, body { margin: 0; height: 100%; background: #07090d; color: var(--text); font: 13px/1.4 system-ui, -apple-system, "Segoe UI", "Hiragino Sans", sans-serif; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; touch-action: none; cursor: grab; }
+  canvas:active { cursor: grabbing; }
+  #panel { position: fixed; top: 12px; right: 12px; width: 250px; padding: 10px 12px; background: var(--panel); backdrop-filter: blur(10px);
+           border: 1px solid rgba(255,255,255,0.08); border-radius: 10px; transition: opacity .2s; }
+  #panel.hidden { opacity: 0; pointer-events: none; }
+  #panel h1 { font-size: 13px; margin: 0 0 6px; font-weight: 600; letter-spacing: .02em; display: flex; justify-content: space-between; }
+  #fps { color: var(--dim); font-weight: 400; font-variant-numeric: tabular-nums; }
+  label { display: grid; grid-template-columns: 74px 1fr 38px; align-items: center; gap: 6px; margin: 3px 0; color: var(--dim); }
+  output { text-align: right; color: var(--text); font-variant-numeric: tabular-nums; }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  #help { position: fixed; left: 12px; bottom: 12px; padding: 6px 10px; background: var(--panel); border-radius: 8px; color: var(--dim); }
+  #help b { color: var(--text); font-weight: 600; }
+  #status { position: fixed; inset: 0; display: grid; place-items: center; pointer-events: none; font-size: 15px; color: var(--dim); }
+  #status.error { color: #ff8a8a; pointer-events: auto; padding: 24px; text-align: center; }
+  @media (max-width: 600px) { #panel { width: auto; left: 12px; } #help { display: none; } }
+</style>
+</head>
+<body>
+<canvas id="gfx"></canvas>
+<div id="status">海を準備中…</div>
+<div id="panel">
+  <h1>WebGPU Ocean <span id="fps"></span></h1>
+  <label>風速 m/s <input type="range" data-key="windSpeed" min="2" max="22" step="0.5"><output></output></label>
+  <label>風向 °   <input type="range" data-key="windAngle" min="0" max="360" step="1"><output></output></label>
+  <label>波の鋭さ <input type="range" data-key="choppy" min="0" max="2" step="0.05"><output></output></label>
+  <label>白波     <input type="range" data-key="foam" min="0" max="3" step="0.05"><output></output></label>
+  <label>太陽高度 ° <input type="range" data-key="sunElevation" min="-2" max="60" step="0.5"><output></output></label>
+  <label>太陽方位 ° <input type="range" data-key="sunAzimuth" min="0" max="360" step="1"><output></output></label>
+  <label>雲量     <input type="range" data-key="clouds" min="0" max="1" step="0.01"><output></output></label>
+  <label>露出     <input type="range" data-key="exposure" min="0.2" max="8" step="0.05"><output></output></label>
+  <label>ブルーム <input type="range" data-key="bloom" min="0" max="0.3" step="0.01"><output></output></label>
+  <label>時間速度 <input type="range" data-key="timeScale" min="0" max="3" step="0.05"><output></output></label>
+</div>
+<div id="help"><b>WASD</b> 移動 · <b>Space/E</b> 上昇 · <b>Q/C</b> 下降 · <b>Shift</b> 加速 · <b>ドラッグ</b> 視点 · <b>ダブルクリック</b> マウスロック · <b>ホイール</b> 速度 · <b>H</b> パネル</div>
+<script type="module" src="src/main.js"></script>
+</body>
+</html>
