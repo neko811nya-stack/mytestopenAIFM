@@ -260,10 +260,12 @@ export class OceanSimulation {
 
     // 2 * log2(N) Stockham stages, ping-ponging between buffer sets 0 and 1 (ends back in set 0).
     this.fftBGs = [];
+    this.stageBuffers = [];
     for (let s = 0; s < 2 * this.log2N; s++) {
       const stage = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM, mappedAtCreation: true });
       new Uint32Array(stage.getMappedRange()).set([1 << (s % this.log2N), s < this.log2N ? 0 : 1, 0, 0]);
       stage.unmap();
+      this.stageBuffers.push(stage);
       const src = s % 2, dst = 1 - src;
       this.fftBGs.push(makeBindGroup(device, fftLayout, [stage, this.paramBuffer, this.bufA[src], this.bufB[src], this.bufA[dst], this.bufB[dst]]));
     }
@@ -274,6 +276,10 @@ export class OceanSimulation {
     for (let l = 1; l < this.mipLevels; l++) {
       this.mipBGs.push(makeBindGroup(device, mipLayout, [level(this.displacement, l - 1), level(this.derivatives, l - 1), level(this.displacement, l), level(this.derivatives, l)]));
     }
+  }
+
+  destroy() {
+    for (const r of [this.paramBuffer, this.spectrum, ...this.bufA, ...this.bufB, this.foam, this.displacement, this.derivatives, ...this.stageBuffers]) r.destroy();
   }
 
   setParams(p) {

@@ -17,7 +17,6 @@ const OCEAN_WGSL = FRAME_WGSL + /* wgsl */ `
 @group(0) @binding(9) var<storage, read> sunVis: array<f32>;
 ` + SKY_SAMPLE_WGSL + /* wgsl */ `
 const CASCADES = 3;
-const TEXELS = 256.0;
 
 struct VSOut {
   @builtin(position) pos: vec4f,
@@ -33,10 +32,11 @@ fn heightScale() -> f32 { return max(1.0, frame.camPos.y / 12.0); }
   let r = polar.x * hs;
   let xz = frame.camPos.xz + vec2f(cos(polar.y), sin(polar.y)) * r;
   let spacing = max(frame.meshB * (polar.x + frame.meshA), 2.0 * PI * polar.x / frame.meshAngular) * hs;
+  let texels = f32(textureDimensions(dispTex).x);
   var disp = vec3f(0.0);
   for (var c = 0; c < CASCADES; c++) {
     let L = frame.cascadeL[c];
-    let lod = max(0.0, log2(spacing * 1.5 / (L / TEXELS)));
+    let lod = max(0.0, log2(spacing * 1.5 / (L / texels)));
     disp += textureSampleLevel(dispTex, oceanSampler, xz / L, c, lod).xyz;
   }
   let world = vec3f(xz.x + disp.x, disp.y, xz.y + disp.z);
@@ -158,8 +158,10 @@ function solveRings(rings, s0, rMax) {
 }
 
 export class OceanRenderer {
-  constructor(device, sim, sky, frame, hdrFormat, { rings = 512, segments = 512, s0 = 0.08, rMax = 24000 } = {}) {
+  constructor(device, sim, sky, frame, hdrFormat, { rings = 512, segments = 512, s0 = 0.08, rMax = 24000, samples = 4 } = {}) {
     this.device = device;
+    // keep the near-camera vertex spacing comparable when the ring count drops
+    s0 *= 512 / rings;
     const { A, b } = solveRings(rings, s0, rMax);
     this.mesh = { A, b, rMax, segments };
     const verts = new Float32Array((rings + 1) * (segments + 1) * 2);
@@ -209,8 +211,13 @@ export class OceanRenderer {
       fragment: { module, entryPoint: 'fs', targets: [{ format: hdrFormat }] },
       primitive: { topology: 'triangle-list', cullMode: 'none' },
       depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'greater' },
-      multisample: { count: 4 },
+      multisample: { count: samples },
     });
+  }
+
+  destroy() {
+    this.vbo.destroy();
+    this.ibo.destroy();
   }
 
   draw(pass) {

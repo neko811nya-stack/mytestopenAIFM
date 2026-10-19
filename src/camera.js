@@ -1,4 +1,5 @@
 // Free-flying camera: WASD to move, Space/E up, Q/C down, Shift to boost, mouse drag (or pointer lock) to look.
+// Touch devices feed the same controls through `touch` (virtual stick + up/down buttons).
 export class FlyCamera {
   constructor(canvas, { position = [0, 6, 0], yaw = 0, pitch = 0 } = {}) {
     this.position = [...position];
@@ -8,6 +9,7 @@ export class FlyCamera {
     this.speed = 12;
     this.keys = new Set();
     this.velocity = [0, 0, 0];
+    this.touch = { x: 0, y: 0, vertical: 0 };
     let dragging = false, lx = 0, ly = 0;
     const look = (dx, dy) => {
       this.yaw += dx * 0.0025;
@@ -51,6 +53,9 @@ export class FlyCamera {
     if (k.has('KeyA') || k.has('ArrowLeft')) add(right, -1);
     if (k.has('Space') || k.has('KeyE')) want[1] += 1;
     if (k.has('KeyQ') || k.has('KeyC')) want[1] -= 1;
+    add(f, -this.touch.y);
+    add(right, this.touch.x);
+    want[1] += this.touch.vertical;
     const boost = k.has('ShiftLeft') || k.has('ShiftRight') ? 5 : 1;
     const s = this.speed * boost;
     // critically damped velocity for smooth starts and stops

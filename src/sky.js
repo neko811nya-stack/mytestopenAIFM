@@ -119,6 +119,7 @@ const CLOUD_BOTTOM = 1400.0;
 const CLOUD_TOP = 2700.0;
 const CLOUD_SCALE = 1.0 / 16000.0;
 const CLOUD_SIGMA = 0.03;
+override LIGHT_STEPS: i32 = 4;
 
 fn cloudShape(uv: vec2f, lod: f32) -> f32 {
   let n = textureSampleLevel(noiseTex, noiseSampler, uv, lod);
@@ -178,7 +179,7 @@ fn marchClouds(ro: vec3f, rd: vec3f, steps: i32, jitter: f32, pixelAngle: f32, a
     if (d > 0.002) {
       var od = 0.0;
       var lt = 0.0;
-      for (var j = 0; j < 4; j++) {
+      for (var j = 0; j < LIGHT_STEPS; j++) {
         let seg = 70.0 * f32(j + 1) * f32(j + 1);
         lt += seg;
         od += cloudDensity(p + L * lt, j < 2, lod + f32(j)) * seg;
@@ -239,13 +240,14 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 const ENV_WGSL = FRAME_WGSL + SKY_BINDINGS_WGSL + SKY_SAMPLE_WGSL + CLOUD_WGSL + /* wgsl */ `
 @group(0) @binding(6) var envOut: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(7) var<storage, read_write> sunVis: array<f32>;
+override ENV_STEPS: i32 = 18;
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) id: vec3u) {
   let size = textureDimensions(envOut);
   let ambient = skyIrradiance();
   if (id.x == 0u && id.y == 0u) {
     // how much of the sun disk is blocked by clouds (drives the sun glitter on the water)
-    let c = marchClouds(frame.camPos, frame.sunDir, 24, 0.5, 0.0, ambient, vec3f(0.0));
+    let c = marchClouds(frame.camPos, frame.sunDir, 16, 0.5, 0.0, ambient, vec3f(0.0));
     sunVis[0] = c.a;
   }
   if (id.x >= size.x || id.y >= size.y) { return; }
@@ -253,7 +255,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   let d = envDir(uv);
   var col = sampleSky(d);
   let haze = sampleSky(normalize(vec3f(d.x, 0.02, d.z)));
-  let c = marchClouds(frame.camPos, d, 18, ign(vec2f(id.xy)), 2.0 * PI / f32(size.x), ambient, haze);
+  let c = marchClouds(frame.camPos, d, ENV_STEPS, ign(vec2f(id.xy)), 2.0 * PI / f32(size.x), ambient, haze);
   col = col * c.a + c.rgb;
   textureStore(envOut, id.xy, vec4f(col, 1.0));
 }
@@ -261,6 +263,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 
 const SKY_RENDER_WGSL = FRAME_WGSL + SKY_BINDINGS_WGSL + SKY_SAMPLE_WGSL + CLOUD_WGSL + /* wgsl */ `
 struct VSOut { @builtin(position) pos: vec4f, @location(0) ndc: vec2f };
+override CLOUD_STEPS: i32 = 40;
 @vertex fn vs(@builtin(vertex_index) i: u32) -> VSOut {
   let p = vec2f(f32((i << 1u) & 2u), f32(i & 2u)) * 2.0 - 1.0;
   var o: VSOut;
@@ -288,7 +291,7 @@ fn sunDisk(rd: vec3f) -> vec3f {
   if (rd.y > -0.02) { col += sunDisk(rd) * smoothstep(-0.02, 0.0, rd.y); }
   let ambient = skyIrradiance();
   let haze = sampleSky(normalize(vec3f(rd.x, 0.02, rd.z)));
-  let c = marchClouds(frame.camPos, rd, 40, ign(in.pos.xy), 1.05 / frame.resolution.y, ambient, haze);
+  let c = marchClouds(frame.camPos, rd, CLOUD_STEPS, ign(in.pos.xy), 0.75 * length(fwidth(rd)), ambient, haze);
   col = col * c.a + c.rgb;
   return vec4f(col, 1.0);
 }
@@ -474,18 +477,28 @@ export function sunTransmittance(sunDir, height = 30) {
   return od.map((x) => Math.exp(-x));
 }
 
+// Noise generation is CPU work (~1 s on a phone), so keep the data across quality rebuilds.
+let noiseCache = null;
+function noiseData() {
+  noiseCache ??= { tex2D: makeNoise(512), tex3D: makeNoise3D(64) };
+  return noiseCache;
+}
+
 export class Sky {
-  constructor(device, frame, hdrFormat) {
+  // q: { samples, cloudSteps, lightSteps, envSize: [w, h], envSteps }
+  constructor(device, frame, hdrFormat, q) {
     this.device = device;
-    this.noise = uploadWithMips(device, makeNoise(512), 512);
+    this.q = q;
+    const noise = noiseData();
+    this.noise = uploadWithMips(device, noise.tex2D, 512);
     this.noiseView = this.noise.createView();
-    this.noise3D = upload3D(device, makeNoise3D(64), 64);
+    this.noise3D = upload3D(device, noise.tex3D, 64);
     this.noise3DView = this.noise3D.createView();
     this.noiseSampler = device.createSampler({ addressModeU: 'repeat', addressModeV: 'repeat', magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear' });
     this.skySampler = device.createSampler({ addressModeU: 'repeat', addressModeV: 'clamp-to-edge', magFilter: 'linear', minFilter: 'linear' });
     const tex = (w, h, label) => device.createTexture({ size: [w, h], format: 'rgba16float', label, usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING });
     this.lut = tex(256, 128, 'sky lut');
-    this.env = tex(1024, 256, 'reflection env');
+    this.env = tex(q.envSize[0], q.envSize[1], 'reflection env');
     this.lutView = this.lut.createView();
     this.envView = this.env.createView();
     this.sunVis = device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE });
@@ -498,7 +511,7 @@ export class Sky {
     const shared = (vis) => [[0, vis, 'uniform'], [1, vis, 'tex'], [2, vis, 'sampler'], [3, vis, 'tex'], [4, vis, 'sampler'], [5, vis, 'tex3d']];
     const sharedRes = [frame.buffer, this.noiseView, this.noiseSampler, this.lutView, this.skySampler, this.noise3DView];
     const envLayout = makeLayout(device, [...shared(C), [6, C, 'storageTex'], [7, C, 'storage']]);
-    this.envPipe = computePipeline(device, envLayout, ENV_WGSL, 'sky env');
+    this.envPipe = computePipeline(device, envLayout, ENV_WGSL, 'sky env', { ENV_STEPS: q.envSteps, LIGHT_STEPS: q.lightSteps });
     this.envBG = makeBindGroup(device, envLayout, [...sharedRes, this.env.createView(), this.sunVis]);
 
     const renderLayout = makeLayout(device, shared(F));
@@ -507,10 +520,10 @@ export class Sky {
       label: 'sky',
       layout: device.createPipelineLayout({ bindGroupLayouts: [renderLayout] }),
       vertex: { module, entryPoint: 'vs' },
-      fragment: { module, entryPoint: 'fs', targets: [{ format: hdrFormat }] },
+      fragment: { module, entryPoint: 'fs', targets: [{ format: hdrFormat }], constants: { CLOUD_STEPS: q.cloudSteps, LIGHT_STEPS: q.lightSteps } },
       primitive: { topology: 'triangle-list' },
       depthStencil: { format: 'depth32float', depthWriteEnabled: false, depthCompare: 'equal' },
-      multisample: { count: 4 },
+      multisample: { count: q.samples },
     });
     this.renderBG = makeBindGroup(device, renderLayout, sharedRes);
   }
@@ -525,7 +538,7 @@ export class Sky {
     const pass2 = encoder.beginComputePass({ label: 'sky env' });
     pass2.setPipeline(this.envPipe);
     pass2.setBindGroup(0, this.envBG);
-    pass2.dispatchWorkgroups(1024 / 8, 256 / 8);
+    pass2.dispatchWorkgroups(Math.ceil(this.q.envSize[0] / 8), Math.ceil(this.q.envSize[1] / 8));
     pass2.end();
   }
 
@@ -533,5 +546,9 @@ export class Sky {
     pass.setPipeline(this.renderPipe);
     pass.setBindGroup(0, this.renderBG);
     pass.draw(3);
+  }
+
+  destroy() {
+    for (const t of [this.noise, this.noise3D, this.lut, this.env, this.sunVis]) t.destroy();
   }
 }

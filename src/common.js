@@ -73,11 +73,11 @@ export function makeBindGroup(device, layout, resources) {
   });
 }
 
-export function computePipeline(device, layout, code, label) {
+export function computePipeline(device, layout, code, label, constants) {
   const module = device.createShaderModule({ code, label });
   return device.createComputePipeline({
     label,
     layout: device.createPipelineLayout({ bindGroupLayouts: [layout] }),
-    compute: { module, entryPoint: 'main' },
+    compute: { module, entryPoint: 'main', constants },
   });
 }

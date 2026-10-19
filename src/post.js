@@ -94,8 +94,10 @@ fn toSrgb(c: vec3f) -> vec3f {
 `;
 
 export class Post {
-  constructor(device, frame, canvasFormat, hdrFormat) {
+  constructor(device, frame, canvasFormat, hdrFormat, { samples = 4, bloom = true } = {}) {
     this.device = device;
+    this.samples = samples;
+    this.bloomEnabled = bloom;
     this.frame = frame;
     this.hdrFormat = hdrFormat;
     this.levels = 6;
@@ -127,15 +129,16 @@ export class Post {
 
   resize(width, height) {
     const d = this.device;
-    for (const t of [this.msaa, this.depth, this.hdr, this.bloom]) t?.destroy();
+    this.destroy();
     const RA = GPUTextureUsage.RENDER_ATTACHMENT, TB = GPUTextureUsage.TEXTURE_BINDING;
-    this.msaa = d.createTexture({ size: [width, height], format: this.hdrFormat, sampleCount: 4, usage: RA });
-    this.depth = d.createTexture({ size: [width, height], format: 'depth32float', sampleCount: 4, usage: RA });
+    const ms = this.samples > 1;
+    this.msaa = ms ? d.createTexture({ size: [width, height], format: this.hdrFormat, sampleCount: this.samples, usage: RA }) : null;
+    this.depth = d.createTexture({ size: [width, height], format: 'depth32float', sampleCount: this.samples, usage: RA });
     this.hdr = d.createTexture({ size: [width, height], format: this.hdrFormat, usage: RA | TB });
     const bw = Math.max(1, width >> 1), bh = Math.max(1, height >> 1);
     this.levels = Math.max(1, Math.min(6, Math.floor(Math.log2(Math.min(bw, bh))) - 1));
     this.bloom = d.createTexture({ size: [bw, bh], format: this.hdrFormat, mipLevelCount: this.levels, usage: RA | TB });
-    this.msaaView = this.msaa.createView();
+    this.msaaView = this.msaa?.createView();
     this.depthView = this.depth.createView();
     this.hdrView = this.hdr.createView();
     this.bloomMips = [...Array(this.levels)].map((_, l) => this.bloom.createView({ baseMipLevel: l, mipLevelCount: 1 }));
@@ -145,10 +148,17 @@ export class Post {
     this.compBG = makeBindGroup(d, this.compLayout, [this.frame.buffer, this.hdrView, this.bloomMips[0], this.sampler]);
   }
 
+  destroy() {
+    for (const t of [this.msaa, this.depth, this.hdr, this.bloom]) t?.destroy();
+  }
+
   beginScene(encoder) {
+    const color = this.msaa
+      ? { view: this.msaaView, resolveTarget: this.hdrView, loadOp: 'clear', storeOp: 'discard', clearValue: [0, 0, 0, 1] }
+      : { view: this.hdrView, loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] };
     return encoder.beginRenderPass({
       label: 'scene',
-      colorAttachments: [{ view: this.msaaView, resolveTarget: this.hdrView, loadOp: 'clear', storeOp: 'discard', clearValue: [0, 0, 0, 1] }],
+      colorAttachments: [color],
       depthStencilAttachment: { view: this.depthView, depthLoadOp: 'clear', depthStoreOp: 'discard', depthClearValue: 0 },
     });
   }
@@ -161,8 +171,10 @@ export class Post {
       p.draw(3);
       p.end();
     };
-    for (let l = 0; l < this.levels; l++) run(l === 0 ? this.downKaris : this.down, this.downBGs[l], this.bloomMips[l], false);
-    for (let l = this.levels - 1; l > 0; l--) run(this.up, this.upBGs[l], this.bloomMips[l - 1], true);
+    if (this.bloomEnabled) {
+      for (let l = 0; l < this.levels; l++) run(l === 0 ? this.downKaris : this.down, this.downBGs[l], this.bloomMips[l], false);
+      for (let l = this.levels - 1; l > 0; l--) run(this.up, this.upBGs[l], this.bloomMips[l - 1], true);
+    }
     run(this.composite, this.compBG, canvasView, false);
   }
 }
