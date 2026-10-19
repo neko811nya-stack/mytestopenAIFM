@@ -30,6 +30,10 @@
   input[type=range] { width: 100%; accent-color: var(--accent); }
   .quality { padding-bottom: 8px; border-bottom: 1px solid var(--line); }
   .quality output { text-align: right; color: var(--accent); font-weight: 600; }
+  #reset { width: 100%; margin-top: 10px; padding: 8px; border-radius: 8px; border: 1px solid var(--line); background: rgba(255,255,255,0.06);
+           color: var(--text); font: inherit; cursor: pointer; }
+  #reset:hover { background: rgba(255,178,107,0.2); }
+  #reset:active { background: rgba(255,178,107,0.35); }
   .scale { display: flex; justify-content: space-between; color: var(--dim); font-size: 11px; margin: -2px 0 0 80px; padding-right: 46px; }
 
   #help { position: fixed; left: 12px; bottom: 12px; padding: 6px 10px; border-radius: 8px; color: var(--dim); }
@@ -74,6 +78,7 @@
   <label>露出     <input type="range" data-key="exposure" min="0.2" max="8" step="0.05"><output></output></label>
   <label>ブルーム <input type="range" data-key="bloom" min="0" max="0.3" step="0.01"><output></output></label>
   <label>時間速度 <input type="range" data-key="timeScale" min="0" max="3" step="0.05"><output></output></label>
+  <button id="reset" type="button">↺ デフォルトに戻す</button>
 </div>
 <div id="help" class="glass"><b>WASD</b> 移動 · <b>Space/E</b> 上昇 · <b>Q/C</b> 下降 · <b>Shift</b> 加速 · <b>ドラッグ</b> 視点 · <b>ダブルクリック</b> マウスロック · <b>ホイール</b> 速度 · <b>H</b> 設定</div>
 <div id="touch">

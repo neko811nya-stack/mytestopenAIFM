@@ -27,17 +27,24 @@ const query = new URLSearchParams(location.search);
 const num = (k, d) => (query.has(k) ? parseFloat(query.get(k)) : d);
 const list = (k) => (query.has(k) ? query.get(k).split(',').map(Number) : null);
 
+// Slider defaults (the reset button returns to these). Quality is per device and is not reset.
+const DEFAULTS = {
+  windSpeed: 9, windAngle: 200, choppy: 1.15, foam: 1.0, sunElevation: 2, sunAzimuth: 20,
+  clouds: 0.55, exposure: 1.8, timeScale: 1, bloom: 0.05,
+};
+const DEFAULT_CAMERA = { position: [0, 7, 0], yaw: DEFAULTS.sunAzimuth * deg, pitch: -4 * deg };
+
 const settings = {
-  windSpeed: num('wind', 9),
-  windAngle: num('windDir', 200),
-  choppy: num('choppy', 1.15),
-  foam: num('foam', 1.0),
-  sunElevation: list('sun')?.[0] ?? 2,
-  sunAzimuth: list('sun')?.[1] ?? 20,
-  clouds: num('clouds', 0.55),
-  exposure: num('exposure', 1.8),
-  timeScale: num('timeScale', 1),
-  bloom: num('bloom', 0.05),
+  windSpeed: num('wind', DEFAULTS.windSpeed),
+  windAngle: num('windDir', DEFAULTS.windAngle),
+  choppy: num('choppy', DEFAULTS.choppy),
+  foam: num('foam', DEFAULTS.foam),
+  sunElevation: list('sun')?.[0] ?? DEFAULTS.sunElevation,
+  sunAzimuth: list('sun')?.[1] ?? DEFAULTS.sunAzimuth,
+  clouds: num('clouds', DEFAULTS.clouds),
+  exposure: num('exposure', DEFAULTS.exposure),
+  timeScale: num('timeScale', DEFAULTS.timeScale),
+  bloom: num('bloom', DEFAULTS.bloom),
   quality: num('q', storedQuality() ?? (isTouch ? 0 : 4)),
 };
 
@@ -88,15 +95,19 @@ async function main() {
   build(settings.quality);
 
   const cam = list('cam');
-  const camera = new FlyCamera(canvas, {
-    position: cam ? cam.slice(0, 3) : [0, 7, 0],
-    yaw: (cam ? cam[3] : settings.sunAzimuth) * deg,
-    pitch: (cam ? cam[4] : -4) * deg,
-  });
+  const camera = new FlyCamera(canvas, cam
+    ? { position: cam.slice(0, 3), yaw: cam[3] * deg, pitch: cam[4] * deg }
+    : { ...DEFAULT_CAMERA, yaw: settings.sunAzimuth * deg });
 
   bindUI(settings, (level) => {
     try { localStorage.setItem('ocean.quality', level); } catch { /* storage may be unavailable */ }
     build(level);
+  }, () => {
+    Object.assign(settings, DEFAULTS);
+    camera.position = [...DEFAULT_CAMERA.position];
+    camera.yaw = DEFAULT_CAMERA.yaw;
+    camera.pitch = DEFAULT_CAMERA.pitch;
+    camera.velocity = [0, 0, 0];
   });
   bindTouch(camera);
 
@@ -186,7 +197,7 @@ async function main() {
   requestAnimationFrame(render);
 }
 
-function bindUI(s, onQuality) {
+function bindUI(s, onQuality, onReset) {
   const panel = document.getElementById('panel');
   const gear = document.getElementById('gear');
   if (query.get('ui') === '0') {
@@ -204,17 +215,26 @@ function bindUI(s, onQuality) {
     if (e.code === 'KeyH' && !(e.target instanceof HTMLInputElement)) setOpen(panel.classList.contains('hidden'));
   });
 
-  for (const input of panel.querySelectorAll('input[data-key]')) {
-    const key = input.dataset.key;
+  const sliders = [...panel.querySelectorAll('input[data-key]')];
+  const show = (input) => {
     const out = input.parentElement.querySelector('output');
-    input.value = s[key];
-    const sync = () => {
-      s[key] = parseFloat(input.value);
-      if (out) out.textContent = (+input.value).toFixed(input.step < 1 ? 2 : 0);
-    };
-    input.addEventListener('input', sync);
-    sync();
+    if (out) out.textContent = (+input.value).toFixed(input.step < 1 ? 2 : 0);
+  };
+  for (const input of sliders) {
+    input.value = s[input.dataset.key];
+    input.addEventListener('input', () => {
+      s[input.dataset.key] = parseFloat(input.value);
+      show(input);
+    });
+    show(input);
   }
+  document.getElementById('reset').addEventListener('click', () => {
+    onReset();
+    for (const input of sliders) {
+      input.value = s[input.dataset.key];
+      show(input);
+    }
+  });
 
   const quality = document.getElementById('quality');
   const name = document.getElementById('qualityName');
