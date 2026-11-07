@@ -304,10 +304,14 @@ function showBoatStatus(st, enabled, driving) {
   // speed / heading readout while steering
   const hud = document.getElementById('helmHud');
   const show = enabled && driving;
-  if (hud.hidden === show) hud.hidden = !show;
+  if (hud.hidden === show) {
+    hud.hidden = !show;
+    document.body.classList.toggle('driving', show);  // the key help would sit under the HUD
+  }
   if (show) {
     const kn = Math.max(0, (st.speed ?? 0) / 0.5144);
-    const deg = Math.round(((90 - (st.heading ?? 0) * 180 / Math.PI) % 360 + 360) % 360);
+    // compass-style: turning to starboard (D) increases the heading
+    const deg = Math.round((((st.heading ?? 0) * 180 / Math.PI) % 360 + 360) % 360);
     const t = `${kn.toFixed(1)} kn · 針路 ${String(deg).padStart(3, '0')}° · ${text}`;
     if (hud.textContent !== t) hud.textContent = t;
   }
