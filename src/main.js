@@ -31,7 +31,7 @@ const list = (k) => (query.has(k) ? query.get(k).split(',').map(Number) : null);
 // Slider defaults (the reset button returns to these). Quality is per device and is not reset.
 const DEFAULTS = {
   windSpeed: 9, windAngle: 200, choppy: 1.15, foam: 1.0, sunElevation: 2, sunAzimuth: 20,
-  clouds: 0.55, exposure: 1.8, timeScale: 1, bloom: 0.05, boat: true,
+  clouds: 0.55, exposure: 1.8, timeScale: 1, bloom: 0.05, boat: true, waveHeight: 1, boatMass: 3, boatSpeed: 0,
 };
 const DEFAULT_CAMERA = { position: [0, 7, 0], yaw: DEFAULTS.sunAzimuth * deg, pitch: -4 * deg };
 
@@ -47,6 +47,9 @@ const settings = {
   timeScale: num('timeScale', DEFAULTS.timeScale),
   bloom: num('bloom', DEFAULTS.bloom),
   boat: query.get('boat') !== '0',
+  waveHeight: num('waves', DEFAULTS.waveHeight),
+  boatMass: num('mass', DEFAULTS.boatMass),
+  boatSpeed: num('speed', DEFAULTS.boatSpeed),
   quality: num('q', storedQuality() ?? (isTouch ? 0 : 4)),
 };
 
@@ -107,12 +110,14 @@ async function main() {
     build(level);
   }, () => {
     Object.assign(settings, DEFAULTS);
+    gfx.boat.respawn();
     camera.position = [...DEFAULT_CAMERA.position];
     camera.yaw = DEFAULT_CAMERA.yaw;
     camera.pitch = DEFAULT_CAMERA.pitch;
     camera.velocity = [0, 0, 0];
   });
   bindTouch(camera);
+  document.getElementById('respawn').addEventListener('click', () => gfx.boat.respawn());
 
   const resize = () => {
     const renderScale = query.has('scale') ? num('scale', 1) : Math.min(window.devicePixelRatio || 1, gfx.q.pixelRatio);
@@ -142,7 +147,10 @@ async function main() {
     const simDt = fixedTime !== null ? 1 / 60 : dt * settings.timeScale;
     simTime += simDt;
 
-    sim.setParams({ windSpeed: settings.windSpeed, windAngle: settings.windAngle * deg, choppy: settings.choppy });
+    sim.setParams({
+      windSpeed: settings.windSpeed, windAngle: settings.windAngle * deg, choppy: settings.choppy,
+      // bigger seas: scaled up geometrically, plus a little extra steepness so they can swamp a boat
+      scale: settings.waveHeight, amplitude: Math.pow(settings.waveHeight, 0.6) });
     const sunDir = dirFromAngles(settings.sunElevation * deg, settings.sunAzimuth * deg);
     const T = sunTransmittance(sunDir);
     // portrait screens: widen the vertical FOV so the horizontal view stays at least ~50 degrees
@@ -186,7 +194,9 @@ async function main() {
     }
     const encoder = device.createCommandEncoder();
     sim.update(encoder, simTime, simDt);
-    boat.update(encoder, simDt, settings.boat);
+    boat.update(encoder, simDt, {
+      enabled: settings.boat, windSpeed: settings.windSpeed, mass: settings.boatMass * 1000, speed: settings.boatSpeed,
+    });
     sky.update(encoder);
     const pass = post.beginScene(encoder);
     ocean.draw(pass);
@@ -195,6 +205,8 @@ async function main() {
     pass.end();
     post.finish(encoder, context.getCurrentTexture().createView());
     device.queue.submit([encoder.finish()]);
+    boat.poll();
+    showBoatStatus(boat.status, settings.boat);
     window.__frames = frameIndex;
     requestAnimationFrame(render);
   };
@@ -257,6 +269,14 @@ function bindUI(s, onQuality, onReset) {
     s.quality = +quality.value;
     onQuality(s.quality);
   });
+}
+
+function showBoatStatus(st, enabled) {
+  const el = document.getElementById('boatStatus');
+  const text = !enabled ? '' : st.sunk ? '沈没…まもなく新しい船が出ます'
+    : st.heel > 100 ? `転覆！ 浸水 ${Math.round(st.flood * 100)}%`
+    : `傾き ${Math.round(st.heel)}° · 浸水 ${Math.round(st.flood * 100)}%`;
+  if (el.textContent !== text) el.textContent = text;
 }
 
 function bindTouch(camera) {

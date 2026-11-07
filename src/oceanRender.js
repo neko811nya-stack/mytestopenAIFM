@@ -137,14 +137,27 @@ fn smithG1(NdotX: f32, a: f32) -> f32 {
   let crisp = smoothstep(cut - aa, cut + aa, cells) * saturate(foamRaw * 4.0);
   var foamCov = mix(crisp, saturate(foamRaw * 0.8), saturate(footprint * 1.5 - 0.2));
 
-  // -------- boat: churned water hugging the hull, no water inside it
+  // -------- boat: churned water hugging the hull, bow wave and wake, no water inside the hull
   var insideHull = false;
   if (boat.pos.w > 0.5) {
     let bp = boatLocal(boat, in.rel + frame.camPos);
     let bd = boatWaterlineDistance(bp);
-    insideHull = bd < -0.04;
-    let lap = saturate(1.0 - bd / 0.9) * (0.45 + 0.55 * cells);
-    foamCov = max(foamCov, smoothstep(0.35, 0.75, lap));
+    // clip only water that is inside the hull volume: a swamped or sinking boat is covered
+    insideHull = bd < -0.04 && bp.y < boatHullTop(bp.x) - 0.05 && boat.ay.y > 0.3;
+    let speed = max(boat.misc.w, 0.0);
+    let splash = boat.angVel.w;
+    var churn = saturate(1.0 - bd / (0.9 + splash * 2.5 + speed * 0.12)) * (0.45 + 0.55 * cells);
+    // bow wave peeling off both sides of the forefoot
+    churn = max(churn, saturate(speed * 0.2) * saturate(1.0 - bd / 1.6) * smoothstep(0.0, 2.5, bp.x) * cells * 1.4);
+    // Kelvin wake: two arms at ~19.5 degrees plus a turbulent centre stripe behind the stern
+    let behind = BOAT_STERN - bp.x;
+    if (behind > 0.0 && speed > 0.3) {
+      let fade = saturate(1.0 - behind / (25.0 + speed * 8.0)) * saturate(speed * 0.25);
+      let arm = abs(abs(bp.z) - 0.35 * behind - 0.9);
+      let centre = abs(bp.z) - (0.9 + behind * 0.04);
+      churn = max(churn, fade * (saturate(1.0 - arm / (0.6 + behind * 0.03)) * 0.9 + saturate(-centre) * 0.8) * (0.4 + 0.8 * cells));
+    }
+    foamCov = max(foamCov, smoothstep(0.35, 0.75, churn));
   }
   let foamLight = (sunCol * saturate(dot(n, L) + 0.1) + ambient) * (0.8 / PI);
   col = mix(col + spec, foamLight, foamCov);

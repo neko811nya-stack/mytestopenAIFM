@@ -1,7 +1,11 @@
-// A procedural sailboat that floats on the simulated sea.
-// Buoyancy runs on the GPU: a one-thread compute pass samples the displacement cascades under the
-// hull, eases heave / pitch / roll toward them with spring-dampers and writes the boat transform
-// into a storage buffer that the boat's vertex shader and the ocean shader (clipping, foam) read.
+// A procedural sailboat floating on the simulated sea, as a rigid body simulated on the GPU.
+// Each frame a one-thread compute pass:
+//   - samples the wave field under ~24 hull columns (height and water particle velocity),
+//   - applies Archimedes buoyancy and drag relative to the moving water at every column,
+//     gravity with a low ballast centre, and wind pressure on the sails,
+//   - lets water that washes over the deck, or a breaking crest, flood the hull (adding weight until it sinks),
+//   - integrates position / quaternion with sub-steps and writes the boat transform.
+// The boat's vertex shader and the ocean shader (clipping, foam, wake) read that state.
 import { FRAME_WGSL, makeLayout, makeBindGroup, computePipeline, VIS } from './common.js';
 import { SKY_SAMPLE_WGSL } from './sky.js';
 
@@ -16,16 +20,39 @@ function hullFrame(x) {
 }
 const sectionWidth = (t) => Math.pow(t, 0.45);  // V-shaped bottom flaring to the gunwale
 
+// Buoyancy columns: vertical prisms from the hull bottom to the deck, 3 across x 8 along.
+const MAX_COLUMNS = 32;
+function hullColumns() {
+  const cols = [];
+  const stations = 8, x0 = STERN + 0.25, x1 = BOW - 0.35, dx = (x1 - x0) / (stations - 1);
+  for (let i = 0; i < stations; i++) {
+    const x = x0 + dx * i;
+    const f = hullFrame(x);
+    for (const k of [-1, 0, 1]) {
+      const z = k * f.beam * 0.6;
+      const t = Math.pow(Math.min(Math.abs(z) / f.beam, 1), 1 / 0.45);
+      cols.push([x, z, f.bottom + (f.top - f.bottom) * t, f.top, dx * (2 * f.beam / 3)]);
+    }
+  }
+  return cols;
+}
+
 export const BOAT_WGSL = /* wgsl */ `
 struct BoatState {
-  pos: vec4f,   // xyz = waterline origin in world space, w = 1 when the boat is shown
+  pos: vec4f,     // xyz = body origin (design waterline) in world space, w = 1 when shown
   ax: vec4f, ay: vec4f, az: vec4f,  // boat-to-world basis (bow, up, port)
-  s0: vec4f,    // heave, heave velocity, pitch, pitch velocity
-  s1: vec4f,    // roll, roll velocity, initialised flag, unused
-  s2: vec4f,    // smoothed horizontal drift (xz)
+  vel: vec4f,     // linear velocity, w = flooding 0..1
+  angVel: vec4f,  // angular velocity (world), w = splash strength
+  rot: vec4f,     // orientation quaternion
+  misc: vec4f,    // x initialised, y time spent sunk, z sailing course, w speed through water
+  prev: array<vec4f, ${MAX_COLUMNS}>,  // last frame's water displacement under each column
 };
 const BOAT_STERN = ${STERN.toFixed(2)};
 const BOAT_BOW = ${BOW.toFixed(2)};
+fn boatHullTop(x: f32) -> f32 {
+  let w = max((x - BOAT_STERN) / (BOAT_BOW - BOAT_STERN) - 0.4, 0.0) / 0.6;
+  return 0.9 + 0.35 * w * w;
+}
 fn boatHalfWidthAtWaterline(x: f32) -> f32 {
   if (x <= BOAT_STERN || x >= BOAT_BOW) { return 0.0; }
   let u = (x - BOAT_STERN) / (BOAT_BOW - BOAT_STERN);
@@ -50,65 +77,195 @@ fn boatWaterlineDistance(p: vec3f) -> f32 {
 `;
 
 const PHYSICS_WGSL = FRAME_WGSL + BOAT_WGSL + /* wgsl */ `
-struct BoatParams { base: vec2f, yaw: f32, dt: f32, enabled: f32, pad0: f32, pad1: f32, pad2: f32 };
+struct BoatParams {
+  base: vec2f, yaw0: f32, dt: f32,
+  enabled: f32, windSpeed: f32, mass: f32, speed: f32,
+  reset: f32, columns: f32, pad0: f32, pad1: f32,
+};
+struct Column { a: vec4f, b: vec4f };  // a = (x, z, bottom y, top y), b.x = horizontal area
 @group(0) @binding(0) var<uniform> P: BoatParams;
 @group(0) @binding(1) var<uniform> frame: Frame;
 @group(0) @binding(2) var dispTex: texture_2d_array<f32>;
 @group(0) @binding(3) var oceanSampler: sampler;
 @group(0) @binding(4) var<storage, read_write> boat: BoatState;
+@group(0) @binding(5) var<storage, read> cols: array<Column>;
+@group(0) @binding(6) var derivTex: texture_2d_array<f32>;
 
-// The hull averages out short ripples: big cascade at full detail, medium one blurred, tiny one skipped.
-fn water(xz: vec2f) -> vec3f {
+const G = 9.81;
+const RHO = 1025.0;
+const SUBSTEPS = 6;
+const FLOOD_MASS = 15000.0;      // water the hull can take on before it is completely full
+const COURSE_RADIUS = 140.0;     // sailing mode circles the start point so the boat stays in view
+const KNOT = 0.5144;
+
+// Displacement of the water surface (largest two cascades: the hull averages out ripples).
+fn disp(xz: vec2f) -> vec3f {
   return textureSampleLevel(dispTex, oceanSampler, xz / frame.cascadeL[0], 0, 0.0).xyz
-       + textureSampleLevel(dispTex, oceanSampler, xz / frame.cascadeL[1], 1, 3.0).xyz;
+       + textureSampleLevel(dispTex, oceanSampler, xz / frame.cascadeL[1], 1, 2.0).xyz;
 }
-fn spring(x: ptr<function, f32>, v: ptr<function, f32>, goal: f32, k: f32, zeta: f32, dt: f32) {
-  *v += (k * (goal - *x) - 2.0 * zeta * sqrt(k) * *v) * dt;
-  *x += *v * dt;
+// The field is stored per undisplaced position: invert the horizontal displacement once.
+fn waterAt(xz: vec2f) -> vec3f {
+  let d0 = disp(xz);
+  return disp(xz - d0.xz);
+}
+// How hard the water here is breaking: the surface folds over where the horizontal
+// Jacobian of the big + medium waves collapses (the same signal that makes whitecaps).
+fn breaking(xz: vec2f) -> f32 {
+  let a = textureSampleLevel(derivTex, oceanSampler, xz / frame.cascadeL[0], 0, 0.0);
+  let b = textureSampleLevel(derivTex, oceanSampler, xz / frame.cascadeL[1], 1, 1.0);
+  let J = (1.0 + a.z + b.z) * (1.0 + a.w + b.w);
+  return saturate((0.55 - J) * 2.5);
+}
+fn qmul(a: vec4f, b: vec4f) -> vec4f { return vec4f(a.w * b.xyz + b.w * a.xyz + cross(a.xyz, b.xyz), a.w * b.w - dot(a.xyz, b.xyz)); }
+fn qrot(q: vec4f, v: vec3f) -> vec3f { return v + 2.0 * cross(q.xyz, cross(q.xyz, v) + q.w * v); }
+fn wrapAngle(a: f32) -> f32 { return a - 2.0 * PI * floor((a + PI) / (2.0 * PI)); }
+
+fn initialise() {
+  let q = vec4f(0.0, sin(-P.yaw0 * 0.5), 0.0, cos(-P.yaw0 * 0.5));
+  let w = waterAt(P.base);
+  boat.pos = vec4f(P.base.x, w.y, P.base.y, P.enabled);
+  boat.vel = vec4f(0.0);
+  boat.angVel = vec4f(0.0);
+  boat.rot = q;
+  boat.misc = vec4f(1.0, 0.0, P.yaw0, 0.0);
+  for (var i = 0; i < ${MAX_COLUMNS}; i++) { boat.prev[i] = vec4f(0.0); }
 }
 
 @compute @workgroup_size(1)
 fn main() {
-  let dt = min(P.dt, 0.05);
-  let fwd = vec2f(cos(P.yaw), sin(P.yaw));
-  let side = vec2f(-fwd.y, fwd.x);
-  // the hull rides the water like a floating particle: probe points are Lagrangian coordinates
-  let c = water(P.base);
-  let hBow = water(P.base + fwd * 3.0).y;
-  let hStern = water(P.base - fwd * 3.0).y;
-  let hPort = water(P.base + side * 1.2).y;
-  let hStbd = water(P.base - side * 1.2).y;
-  let heaveT = (c.y * 2.0 + hBow + hStern + hPort + hStbd) / 6.0;
-  let pitchT = atan2(hBow - hStern, 6.0);
-  let rollT = -atan2(hPort - hStbd, 2.4) * 1.2;
+  if (boat.misc.x < 0.5 || P.reset > 0.5) { initialise(); }
+  let dt = clamp(P.dt, 1e-4, 0.05);
+  let n = min(u32(P.columns), ${MAX_COLUMNS}u);
 
-  var y = boat.s0.x; var vy = boat.s0.y; var pitch = boat.s0.z; var vp = boat.s0.w;
-  var roll = boat.s1.x; var vr = boat.s1.y;
-  var drift = boat.s2.xy;
-  if (boat.s1.z < 0.5) {
-    y = heaveT; pitch = pitchT; roll = rollT; vy = 0.0; vp = 0.0; vr = 0.0; drift = c.xz;
-  } else {
-    spring(&y, &vy, heaveT, 10.0, 0.55, dt);
-    spring(&pitch, &vp, pitchT, 7.0, 0.45, dt);
-    spring(&roll, &vr, rollT, 5.0, 0.25, dt);   // lightly damped: boats keep rolling
-    drift = mix(drift, c.xz, 1.0 - exp(-dt * 2.0));
+  var pos = boat.pos.xyz;
+  var vel = boat.vel.xyz;
+  var flood = boat.vel.w;
+  var omega = boat.angVel.xyz;
+  var splash = boat.angVel.w * exp(-dt * 1.8);
+  var q = boat.rot;
+  var course = boat.misc.z;
+  let mass = P.mass + flood * FLOOD_MASS;
+  let massScale = mass / 3000.0;
+  // body-frame inertia (roll about the keel, yaw, pitch); the mast adds to roll
+  let invI = 1.0 / (vec3f(5200.0, 16000.0, 15000.0) * massScale);
+  let comLocal = vec3f(0.0, -0.55, 0.0);  // ballast keel keeps the centre of mass low
+
+  // ---- water under each column (sampled once per frame; columns barely move in 1/60 s)
+  var water: array<vec4f, ${MAX_COLUMNS}>;     // xyz = water velocity, w = surface height
+  var breakers: array<f32, ${MAX_COLUMNS}>;
+  var meanFlow = vec3f(0.0);
+  for (var i = 0u; i < n; i++) {
+    let c = cols[i];
+    let p = pos + qrot(q, vec3f(c.a.x, 0.0, c.a.y));
+    let w = waterAt(p.xz);
+    let prev = boat.prev[i];
+    let flow = select(vec3f(0.0), (w - prev.xyz) / dt, prev.w > 0.5);
+    water[i] = vec4f(clamp(flow, vec3f(-15.0), vec3f(15.0)), w.y);
+    breakers[i] = breaking(p.xz);
+    boat.prev[i] = vec4f(w, 1.0);
+    meanFlow += water[i].xyz / f32(n);
   }
-  boat.s0 = vec4f(y, vy, pitch, vp);
-  boat.s1 = vec4f(roll, vr, 1.0, 0.0);
-  boat.s2 = vec4f(drift, 0.0, 0.0);
 
-  // basis = yaw * pitch (about the beam) * roll (about the keel)
-  let cy = cos(P.yaw); let sy = sin(P.yaw);
-  let ry = mat3x3f(vec3f(cy, 0.0, sy), vec3f(0.0, 1.0, 0.0), vec3f(-sy, 0.0, cy));
-  let cp = cos(pitch); let sp = sin(pitch);
-  let rz = mat3x3f(vec3f(cp, sp, 0.0), vec3f(-sp, cp, 0.0), vec3f(0.0, 0.0, 1.0));
-  let cr = cos(roll); let sr = sin(roll);
-  let rx = mat3x3f(vec3f(1.0, 0.0, 0.0), vec3f(0.0, cr, sr), vec3f(0.0, -sr, cr));
-  let m = ry * rz * rx;
-  boat.pos = vec4f(P.base.x + drift.x, y - 0.08, P.base.y + drift.y, P.enabled);
-  boat.ax = vec4f(m[0], 0.0);
-  boat.ay = vec4f(m[1], 0.0);
-  boat.az = vec4f(m[2], 0.0);
+  let h = dt / f32(SUBSTEPS);
+  for (var s = 0; s < SUBSTEPS; s++) {
+    let ax = qrot(q, vec3f(1.0, 0.0, 0.0));
+    let ay = qrot(q, vec3f(0.0, 1.0, 0.0));
+    var F = vec3f(0.0, -mass * G, 0.0);
+    var T = cross(qrot(q, comLocal), F);
+
+    for (var i = 0u; i < n; i++) {
+      let c = cols[i];
+      let wb = pos + qrot(q, vec3f(c.a.x, c.a.z, c.a.y));
+      let wt = pos + qrot(q, vec3f(c.a.x, c.a.w, c.a.y));
+      let lo = min(wb.y, wt.y);
+      let hi = max(wb.y, wt.y);
+      let surface = water[i].w;
+      let sub = clamp(surface - lo, 0.0, hi - lo);
+      if (sub <= 0.0) { continue; }
+      let frac = sub / max(hi - lo, 0.05);
+      let pt = mix(wb, wt, saturate((lo + 0.5 * sub - wb.y) / (wt.y - wb.y + 1e-4)));
+      let r = pt - pos;
+      // Archimedes: weight of the displaced water column
+      var f = vec3f(0.0, RHO * G * c.b.x * sub, 0.0);
+      // drag against the moving water: little along the hull, a lot sideways (keel) and vertically
+      let rel = vel + cross(omega, r) - water[i].xyz;
+      let relLocal = vec3f(dot(rel, ax), dot(rel, ay), dot(rel, qrot(q, vec3f(0.0, 0.0, 1.0))));
+      let k = vec3f(120.0, 1500.0, 2600.0) * c.b.x * frac * (1.0 + 0.35 * length(relLocal));
+      let dragLocal = -k * relLocal;
+      f += ax * dragLocal.x + ay * dragLocal.y + qrot(q, vec3f(0.0, 0.0, 1.0)) * dragLocal.z;
+      F += f;
+      T += cross(r, f);
+      // green water over the deck floods the hull
+      if (surface > hi && ay.y > 0.2) { flood += (surface - hi) * c.b.x * 0.05 * h; }
+      // a breaking crest slams into the topsides (shoving and rolling the hull) and pours aboard
+      let brk = breakers[i];
+      if (brk > 0.0) {
+        let hit = vec3f(frame.windDir.x, 0.0, frame.windDir.y) * (brk * 14000.0 * c.b.x) + vec3f(0.0, -brk * 3000.0 * c.b.x, 0.0);
+        let at = pos + qrot(q, vec3f(c.a.x, c.a.w, c.a.y)) - pos;
+        F += hit;
+        T += cross(at, hit);
+        flood += brk * c.b.x * 0.02 * h;
+        if (s == 0) { splash = max(splash, brk); }
+      }
+      // the bow slamming into a rising wave throws spray
+      if (c.a.x > 1.5 && s == 0) {
+        let impact = water[i].y - (vel.y + cross(omega, r).y);
+        splash = max(splash, saturate((impact - 1.2) * 0.35));
+      }
+    }
+
+    // wind pressure on ~16 m^2 of sail, centred 4.8 m up; spills as the boat heels
+    let windDir = vec3f(frame.windDir.x, 0.0, frame.windDir.y);
+    let upright = max(ay.y, 0.0);
+    let fw = windDir * (0.5 * 1.225 * 1.1 * 16.0 * P.windSpeed * P.windSpeed * upright * upright);
+    F += fw;
+    T += cross(qrot(q, vec3f(-0.6, 4.8, 0.0)), fw);
+
+    // helm: hold the mooring (speed 0) or sail a big circle
+    let yaw = atan2(ax.z, ax.x);
+    var targetYaw = P.yaw0;
+    if (P.speed > 0.05) {
+      course += P.speed * KNOT / COURSE_RADIUS * h;
+      targetYaw = course;
+      let fwd = normalize(vec3f(ax.x, 0.0, ax.z) + vec3f(1e-5));
+      let ahead = dot(vel - meanFlow, fwd);
+      F += fwd * clamp((P.speed * KNOT - ahead) * 3000.0 * massScale, -9000.0, 9000.0) * upright;
+    } else {
+      course = P.yaw0;
+      let off = pos.xz - P.base;
+      F += vec3f(-350.0 * off.x - 900.0 * vel.x, 0.0, -350.0 * off.y - 900.0 * vel.z) * massScale;
+    }
+    T.y += (-wrapAngle(yaw - targetYaw) * 9000.0 - omega.y * 14000.0) * massScale * upright;
+
+    // integrate (semi-implicit Euler); inertia rotated into world space
+    vel += F / mass * h;
+    pos += vel * h;
+    let tl = vec3f(dot(T, ax), dot(T, ay), dot(T, qrot(q, vec3f(0.0, 0.0, 1.0))));
+    let al = tl * invI;
+    omega += (ax * al.x + ay * al.y + qrot(q, vec3f(0.0, 0.0, 1.0)) * al.z) * h;
+    omega *= exp(-0.3 * h);
+    q = normalize(q + 0.5 * qmul(vec4f(omega, 0.0), q) * h);
+  }
+
+  // a capsized hull fills quickly; a little water drains when she is upright and dry
+  let ayEnd = qrot(q, vec3f(0.0, 1.0, 0.0));
+  if (ayEnd.y < 0.25) { flood += 0.08 * dt; } else { flood -= 0.002 * dt; }
+  flood = saturate(flood);
+
+  // sunk: wait on the bottom for a moment, then a fresh boat appears
+  var sunk = boat.misc.y;
+  if (pos.y < -10.0) { sunk += dt; } else { sunk = 0.0; }
+
+  boat.pos = vec4f(pos, P.enabled);
+  boat.vel = vec4f(vel, flood);
+  boat.angVel = vec4f(omega, splash);
+  boat.rot = q;
+  let fwdNow = qrot(q, vec3f(1.0, 0.0, 0.0));
+  boat.misc = vec4f(1.0, sunk, course, dot(vel - meanFlow, fwdNow));
+  boat.ax = vec4f(fwdNow, 0.0);
+  boat.ay = vec4f(ayEnd, 0.0);
+  boat.az = vec4f(qrot(q, vec3f(0.0, 0.0, 1.0)), 0.0);
+  if (sunk > 3.0) { boat.misc.x = 0.0; }
 }
 `;
 
@@ -274,8 +431,20 @@ export class Boat {
     this.device = device;
     this.base = base;
     this.yaw = yaw;
-    this.params = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    this.state = device.createBuffer({ size: 112, usage: GPUBufferUsage.STORAGE });
+    this.status = { flood: 0, sunk: false, heel: 0 };
+    this.params = device.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.state = device.createBuffer({ size: (8 + MAX_COLUMNS) * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    this.readback = device.createBuffer({ size: 128, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    this.reading = false;
+    this.resetPending = false;
+
+    const columns = hullColumns();
+    this.columnCount = columns.length;
+    const colData = new Float32Array(MAX_COLUMNS * 8);
+    columns.forEach((c, i) => colData.set([c[0], c[1], c[2], c[3], c[4], 0, 0, 0], i * 8));
+    this.columns = device.createBuffer({ size: colData.byteLength, usage: GPUBufferUsage.STORAGE, mappedAtCreation: true });
+    new Float32Array(this.columns.getMappedRange()).set(colData);
+    this.columns.unmap();
 
     const verts = buildMesh();
     this.vertexCount = verts.length / 10;
@@ -284,10 +453,10 @@ export class Boat {
     this.vbo.unmap();
 
     const C = VIS.C, VF = VIS.VF, F = VIS.F;
-    const physLayout = makeLayout(device, [[0, C, 'uniform'], [1, C, 'uniform'], [2, C, 'texArray'], [3, C, 'sampler'], [4, C, 'storage']]);
+    const physLayout = makeLayout(device, [[0, C, 'uniform'], [1, C, 'uniform'], [2, C, 'texArray'], [3, C, 'sampler'], [4, C, 'storage'], [5, C, 'read'], [6, C, 'texArray']]);
     this.physPipe = computePipeline(device, physLayout, PHYSICS_WGSL, 'boat physics');
     const sampler = device.createSampler({ addressModeU: 'repeat', addressModeV: 'repeat', magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear' });
-    this.physBG = makeBindGroup(device, physLayout, [this.params, frame.buffer, sim.displacementView, sampler, this.state]);
+    this.physBG = makeBindGroup(device, physLayout, [this.params, frame.buffer, sim.displacementView, sampler, this.state, this.columns, sim.derivativesView]);
 
     const layout = makeLayout(device, [[0, VF, 'uniform'], [1, VF, 'read'], [2, F, 'tex'], [3, F, 'sampler'], [4, F, 'tex'], [5, F, 'read']]);
     this.bindGroup = makeBindGroup(device, layout, [frame.buffer, this.state, sky.envView, sky.skySampler, sky.lutView, sky.sunVis]);
@@ -313,14 +482,44 @@ export class Boat {
     });
   }
 
-  update(encoder, dt, enabled) {
-    this.enabled = enabled;
-    this.device.queue.writeBuffer(this.params, 0, new Float32Array([this.base[0], this.base[1], this.yaw, dt, enabled ? 1 : 0, 0, 0, 0]));
+  respawn() {
+    this.resetPending = true;
+  }
+
+  // opts: { enabled, windSpeed (m/s), mass (kg), speed (knots) }
+  update(encoder, dt, opts) {
+    this.enabled = opts.enabled;
+    this.device.queue.writeBuffer(this.params, 0, new Float32Array([
+      this.base[0], this.base[1], this.yaw, dt,
+      opts.enabled ? 1 : 0, opts.windSpeed, opts.mass, opts.speed,
+      this.resetPending ? 1 : 0, this.columnCount, 0, 0,
+    ]));
+    this.resetPending = false;
     const pass = encoder.beginComputePass({ label: 'boat physics' });
     pass.setPipeline(this.physPipe);
     pass.setBindGroup(0, this.physBG);
     pass.dispatchWorkgroups(1);
     pass.end();
+    // a few times per second, read back flooding / heel for the status line
+    if (!this.reading && performance.now() - (this.lastRead || 0) > 250) {
+      encoder.copyBufferToBuffer(this.state, 0, this.readback, 0, 128);
+      this.copied = true;
+    }
+  }
+
+  // call after queue.submit
+  poll() {
+    if (!this.copied) return;
+    this.copied = false;
+    this.reading = true;
+    this.lastRead = performance.now();
+    this.readback.mapAsync(GPUMapMode.READ).then(() => {
+      const d = new Float32Array(this.readback.getMappedRange().slice(0));
+      this.readback.unmap();
+      // ay.y (index 9) is the cosine of the heel/pitch; pos.y (1); vel.w (19) flood; misc.y (29) sunk time
+      this.status = { flood: d[19], heel: Math.acos(Math.min(1, Math.max(-1, d[9]))) * 180 / Math.PI, sunk: d[1] < -3, speed: d[31] };
+      this.reading = false;
+    }).catch(() => { this.reading = false; });
   }
 
   draw(pass) {
@@ -332,6 +531,6 @@ export class Boat {
   }
 
   destroy() {
-    for (const b of [this.params, this.state, this.vbo]) b.destroy();
+    for (const b of [this.params, this.state, this.readback, this.columns, this.vbo]) b.destroy();
   }
 }

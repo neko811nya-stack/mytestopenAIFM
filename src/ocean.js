@@ -11,7 +11,7 @@ import { lgamma } from './math.js';
 const SIM_WGSL = /* wgsl */ `
 struct SimParams {
   N: u32, cascades: u32, time: f32, dt: f32,
-  windDir: vec2f, windSpeed: f32, fetch: f32,
+  windDir: vec2f, windSpeed: f32, scale: f32,
   gamma: f32, spread: f32, spreadNorm: f32, choppy: f32,
   foamDecay: f32, foamThreshold: f32, foamInject: f32, seed: u32,
   cascadeL: vec4f, kLo: vec4f, kHi: vec4f,
@@ -66,15 +66,21 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   let xi = gaussian2(&state);
   var h0 = vec2f(0.0);
   var omega = 0.0;
-  if (kl > 1e-6 && kl >= P.kLo[c] && kl < P.kHi[c]) {
-    omega = sqrt(G * kl);
-    let dOmegaDk = G / (2.0 * omega);
-    let theta = atan2(k.y, k.x) - atan2(P.windDir.y, P.windDir.x);
+  // P.scale enlarges the whole sea geometrically: the wave at k is the physical wave at k * scale,
+  // made scale times bigger, so steepness (and therefore breaking / foam) stays the same.
+  let kp = k * P.scale;
+  let klp = kl * P.scale;
+  if (kl > 1e-6 && klp >= P.kLo[c] && klp < P.kHi[c]) {
+    omega = sqrt(G * kl);  // the real dispersion of the enlarged wave: big seas move slower
+    let wp = sqrt(G * klp);
+    let dOmegaDk = G / (2.0 * wp);
+    let theta = atan2(kp.y, kp.x) - atan2(P.windDir.y, P.windDir.x);
     let D = P.spreadNorm * pow(max(abs(cos(0.5 * theta)), 1e-5), 2.0 * P.spread);
     // S(kx,kz) = S(omega) * domega/dk / k * D(theta)
-    let S = jonswap(omega) * dOmegaDk / kl * D;
-    let damp = exp(-kl * kl * 1e-4);  // remove sub-centimetre capillaries
-    h0 = xi * sqrt(max(S, 0.0) * dk * dk * 0.25) * P.amplitude * damp;
+    let S = jonswap(wp) * dOmegaDk / klp * D;
+    let damp = exp(-klp * klp * 1e-4);  // remove sub-centimetre capillaries
+    let dkp = dk * P.scale;
+    h0 = xi * sqrt(max(S, 0.0) * dkp * dkp * 0.25) * P.scale * P.amplitude * damp;
   }
   // Quantize the dispersion so the whole simulation loops seamlessly every loopPeriod seconds.
   let w0 = TAU / P.loopPeriod;
@@ -214,12 +220,12 @@ export class OceanSimulation {
   constructor(device, { N = 256, lengths = [256, 48, 9] } = {}) {
     this.device = device;
     this.N = N;
-    this.lengths = lengths;
+    this.baseLengths = lengths;
     this.cascades = lengths.length;
     this.log2N = Math.round(Math.log2(N));
     this.mipLevels = this.log2N + 1;
     this.params = {
-      windSpeed: 9, windAngle: 0, fetch: 120000, gamma: 3.3, spread: 6, choppy: 1.1, amplitude: 1.0,
+      windSpeed: 9, windAngle: 0, fetch: 120000, gamma: 3.3, spread: 6, choppy: 1.1, amplitude: 1.0, scale: 1.0,
       foamDecay: 0.45, foamThreshold: 0.77, foamInject: 5.0, seed: 1337, loopPeriod: 600,
     };
     this.spectrumDirty = true;
@@ -283,7 +289,7 @@ export class OceanSimulation {
   }
 
   setParams(p) {
-    const spectral = ['windSpeed', 'windAngle', 'fetch', 'gamma', 'spread', 'amplitude', 'seed'];
+    const spectral = ['windSpeed', 'windAngle', 'fetch', 'gamma', 'spread', 'amplitude', 'seed', 'scale'];
     for (const [k, v] of Object.entries(p)) {
       if (this.params[k] === v) continue;
       this.params[k] = v;
@@ -292,8 +298,13 @@ export class OceanSimulation {
   }
 
   // Cascade i covers the wavenumber band [kLo_i, kHi_i) so that no wavelength is counted twice.
+  // tile sizes in metres (grow with the sea scale)
+  get lengths() {
+    return this.baseLengths.map((L) => L * this.params.scale);
+  }
+
   bands() {
-    const lo = this.lengths.map((L, i) => (i === 0 ? 1e-4 : (2 * Math.PI / L) * 6));
+    const lo = this.baseLengths.map((L, i) => (i === 0 ? 1e-4 : (2 * Math.PI / L) * 6));
     const hi = lo.map((_, i) => (i + 1 < lo.length ? lo[i + 1] : 1e9));
     return { lo, hi };
   }
@@ -309,7 +320,7 @@ export class OceanSimulation {
     const buf = new ArrayBuffer(128);
     const f = new Float32Array(buf), u = new Uint32Array(buf);
     u[0] = this.N; u[1] = this.cascades; f[2] = this.time % p.loopPeriod; f[3] = dt;
-    f[4] = Math.cos(p.windAngle); f[5] = Math.sin(p.windAngle); f[6] = U; f[7] = F;
+    f[4] = Math.cos(p.windAngle); f[5] = Math.sin(p.windAngle); f[6] = U; f[7] = p.scale;
     f[8] = p.gamma; f[9] = s; f[10] = spreadNorm; f[11] = p.choppy;
     f[12] = p.foamDecay; f[13] = p.foamThreshold; f[14] = p.foamInject; u[15] = p.seed;
     for (let i = 0; i < 4; i++) {

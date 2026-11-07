@@ -31,6 +31,10 @@
   label.check input { justify-self: start; width: 18px; height: 18px; margin: 0; accent-color: var(--accent); }
   .quality { padding-bottom: 8px; border-bottom: 1px solid var(--line); }
   .quality output { text-align: right; color: var(--accent); font-weight: 600; }
+  .boatrow { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 4px 0 2px; color: var(--dim); font-size: 12px; min-height: 28px; }
+  #respawn { padding: 5px 10px; border-radius: 8px; border: 1px solid var(--line); background: rgba(255,255,255,0.06); color: var(--text); font: inherit; cursor: pointer; white-space: nowrap; }
+  #respawn:active { background: rgba(255,178,107,0.35); }
+  .version { color: var(--dim); font-size: 11px; text-align: right; margin-top: 6px; }
   #reset { width: 100%; margin-top: 10px; padding: 8px; border-radius: 8px; border: 1px solid var(--line); background: rgba(255,255,255,0.06);
            color: var(--text); font: inherit; cursor: pointer; }
   #reset:hover { background: rgba(255,178,107,0.2); }
@@ -70,8 +74,13 @@
   <label>風速 m/s <input type="range" data-key="windSpeed" min="2" max="22" step="0.5"><output></output></label>
   <label>風向 °   <input type="range" data-key="windAngle" min="0" max="360" step="1"><output></output></label>
   <label>波の鋭さ <input type="range" data-key="choppy" min="0" max="2" step="0.05"><output></output></label>
+  <label>波の高さ ×  <input type="range" data-key="waveHeight" min="0.3" max="3" step="0.05"><output></output></label>
   <label>白波     <input type="range" data-key="foam" min="0" max="3" step="0.05"><output></output></label>
-  <label class="check">船 <input type="checkbox" id="boat"><span></span></label>
+  <h2>船</h2>
+  <label class="check">表示 <input type="checkbox" id="boat"><span></span></label>
+  <label>重さ t   <input type="range" data-key="boatMass" min="1" max="12" step="0.1"><output></output></label>
+  <label>速度 kn  <input type="range" data-key="boatSpeed" min="0" max="10" step="0.5"><output></output></label>
+  <div class="boatrow"><span id="boatStatus"></span><button id="respawn" type="button">船を戻す</button></div>
   <h2>空</h2>
   <label>太陽高度 ° <input type="range" data-key="sunElevation" min="-2" max="60" step="0.5"><output></output></label>
   <label>太陽方位 ° <input type="range" data-key="sunAzimuth" min="0" max="360" step="1"><output></output></label>
@@ -81,6 +90,7 @@
   <label>ブルーム <input type="range" data-key="bloom" min="0" max="0.3" step="0.01"><output></output></label>
   <label>時間速度 <input type="range" data-key="timeScale" min="0" max="3" step="0.05"><output></output></label>
   <button id="reset" type="button">↺ デフォルトに戻す</button>
+  <div class="version">v4 · 船の物理</div>
 </div>
 <div id="help" class="glass"><b>WASD</b> 移動 · <b>Space/E</b> 上昇 · <b>Q/C</b> 下降 · <b>Shift</b> 加速 · <b>ドラッグ</b> 視点 · <b>ダブルクリック</b> マウスロック · <b>ホイール</b> 速度 · <b>H</b> 設定</div>
 <div id="touch">

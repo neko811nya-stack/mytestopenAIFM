@@ -1,0 +1,40 @@
+<!doctype html><meta charset="utf-8"><body><script type="module">
+// Debug page: runs the ocean + boat physics without rendering and prints a trajectory.
+//   tools/boatsim.html?wind=9&waves=1&mass=3&speed=0&seconds=40
+import { FrameUniforms } from '../src/common.js';
+import { OceanSimulation } from '../src/ocean.js';
+import { Sky } from '../src/sky.js';
+import { Boat } from '../src/boat.js';
+const q = new URLSearchParams(location.search);
+const p = (k, d) => (q.has(k) ? +q.get(k) : d);
+const wind = p('wind', 9), waves = p('waves', 1), mass = p('mass', 3) * 1000, speed = p('speed', 0), seconds = p('seconds', 40);
+const device = await (await navigator.gpu.requestAdapter()).requestDevice();
+const frame = new FrameUniforms(device);
+const sim = new OceanSimulation(device, { N: 128, lengths: [256, 48, 9] });
+const sky = new Sky(device, frame, 'rgba16float', { samples: 1, cloudSteps: 8, lightSteps: 1, envSize: [64, 16], envSteps: 2 });
+const boat = new Boat(device, sim, sky, frame, 'rgba16float', { samples: 1 });
+const wa = 200 * Math.PI / 180;
+sim.setParams({ windSpeed: wind, windAngle: wa, scale: waves, amplitude: Math.pow(waves, 0.6) });
+frame.set('cascadeL', [...sim.lengths, 1]);
+frame.set('windDir', [Math.cos(wa), Math.sin(wa)]);
+frame.upload(device);
+const dt = 1 / 30, rows = [];
+const rb = device.createBuffer({ size: 128, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+for (let i = 0; i < seconds / dt; i++) {
+  const enc = device.createCommandEncoder();
+  sim.update(enc, 20 + i * dt, dt);
+  boat.update(enc, dt, { enabled: true, windSpeed: wind, mass, speed });
+  boat.copied = false;
+  if (i % 15 === 0) enc.copyBufferToBuffer(boat.state, 0, rb, 0, 128);
+  device.queue.submit([enc.finish()]);
+  if (i % 15 === 0) {
+    await rb.mapAsync(GPUMapMode.READ);
+    const d = new Float32Array(rb.getMappedRange().slice(0));
+    rb.unmap();
+    const heel = Math.acos(Math.max(-1, Math.min(1, d[9]))) * 180 / Math.PI;
+    rows.push(`t=${(i * dt).toFixed(1).padStart(5)} y=${d[1].toFixed(2).padStart(6)} heel=${heel.toFixed(0).padStart(3)} flood=${(d[19] * 100).toFixed(0).padStart(3)}% splash=${d[23].toFixed(2)} xz=(${d[0].toFixed(1)},${d[2].toFixed(1)}) v=${d[31].toFixed(2)}`);
+  }
+}
+document.body.textContent = rows.join('\n');
+window.__done = true;
+</script>
