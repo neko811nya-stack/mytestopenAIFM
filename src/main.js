@@ -127,7 +127,7 @@ async function main() {
     position: () => (settings.boat ? gfx.boat.status.position : null),  // keep watching while it sinks
   }];
   const aim = { target: targets[0], smooth: null };
-  const camButtons = bindCameraModes(camera, () => aim.smooth);
+  const camButtons = bindCameraModes(camera, () => aim.smooth, () => gfx.boat);
   document.getElementById('respawn').addEventListener('click', () => gfx.boat.respawn());
 
   const resize = () => {
@@ -161,8 +161,9 @@ async function main() {
       const a = 1 - Math.exp(-dt * 6), ay = 1 - Math.exp(-dt * 1.5);
       aim.smooth = [aim.smooth[0] + (raw[0] - aim.smooth[0]) * a, aim.smooth[1] + (raw[1] + 2.5 - aim.smooth[1]) * ay, aim.smooth[2] + (raw[2] - aim.smooth[2]) * a];
     }
-    if (query.has('cammode') && aim.smooth && !aim.started) { aim.started = true; camera.setMode(query.get('cammode'), aim.smooth); }
-    camera.update(dt, aim.smooth);
+    const heading = gfx.boat.status.heading ?? 0;
+    if (query.has('cammode') && aim.smooth && !aim.started) { aim.started = true; camera.setMode(query.get('cammode'), aim.smooth, heading); }
+    camera.update(dt, aim.smooth, heading);
     camButtons.sync();
     const simDt = fixedTime !== null ? 1 / 60 : dt * settings.timeScale;
     simTime += simDt;
@@ -214,8 +215,11 @@ async function main() {
     }
     const encoder = device.createCommandEncoder();
     sim.update(encoder, simTime, simDt);
+    const driving = camera.mode === 'drive';
+    const input = camera.input();
     boat.update(encoder, simDt, {
       enabled: settings.boat, windSpeed: settings.windSpeed, mass: settings.boatMass * 1000, speed: settings.boatSpeed,
+      helm: driving ? { throttle: input.ahead, rudder: input.side } : null,
     });
     sky.update(encoder);
     const pass = post.beginScene(encoder);
@@ -226,7 +230,7 @@ async function main() {
     post.finish(encoder, context.getCurrentTexture().createView());
     device.queue.submit([encoder.finish()]);
     boat.poll();
-    showBoatStatus(boat.status, settings.boat);
+    showBoatStatus(boat.status, settings.boat, driving);
     window.__frames = frameIndex;
     requestAnimationFrame(render);
   };
@@ -291,24 +295,44 @@ function bindUI(s, onQuality, onReset) {
   });
 }
 
-function showBoatStatus(st, enabled) {
+function showBoatStatus(st, enabled, driving) {
   const el = document.getElementById('boatStatus');
   const text = !enabled ? '' : st.sunk ? '沈没…まもなく新しい船が出ます'
     : st.heel > 100 ? `転覆！ 浸水 ${Math.round(st.flood * 100)}%`
     : `傾き ${Math.round(st.heel)}° · 浸水 ${Math.round(st.flood * 100)}%`;
   if (el.textContent !== text) el.textContent = text;
+  // speed / heading readout while steering
+  const hud = document.getElementById('helmHud');
+  const show = enabled && driving;
+  if (hud.hidden === show) hud.hidden = !show;
+  if (show) {
+    const kn = Math.max(0, (st.speed ?? 0) / 0.5144);
+    const deg = Math.round(((90 - (st.heading ?? 0) * 180 / Math.PI) % 360 + 360) % 360);
+    const t = `${kn.toFixed(1)} kn · 針路 ${String(deg).padStart(3, '0')}° · ${text}`;
+    if (hud.textContent !== t) hud.textContent = t;
+  }
 }
 
-function bindCameraModes(camera, getTarget) {
-  const buttons = { lock: document.getElementById('camLock'), follow: document.getElementById('camFollow') };
-  const toggle = (mode) => camera.setMode(camera.mode === mode ? 'free' : mode, getTarget());
-  buttons.lock.addEventListener('click', () => toggle('lock'));
-  buttons.follow.addEventListener('click', () => toggle('follow'));
+function bindCameraModes(camera, getTarget, getBoat) {
+  const buttons = {
+    lock: document.getElementById('camLock'), follow: document.getElementById('camFollow'), drive: document.getElementById('camDrive'),
+  };
+  const setMode = (mode) => {
+    const boat = getBoat();
+    // handing back the helm: drop anchor where the boat is instead of hauling it home
+    if (camera.mode === 'drive' && mode !== 'drive' && boat.status.position) {
+      boat.setAnchor([boat.status.position[0], boat.status.position[2]], boat.status.heading);
+    }
+    camera.setMode(mode, getTarget(), boat.status.heading ?? 0);
+  };
+  const toggle = (mode) => setMode(camera.mode === mode ? 'free' : mode);
+  for (const [mode, b] of Object.entries(buttons)) b.addEventListener('click', () => toggle(mode));
   window.addEventListener('keydown', (e) => {
     if (e.target instanceof HTMLInputElement) return;
     if (e.code === 'KeyL') toggle('lock');
     if (e.code === 'KeyF') toggle('follow');
-    if (e.code === 'Escape') camera.setMode('free');
+    if (e.code === 'KeyB') toggle('drive');
+    if (e.code === 'Escape') setMode('free');
   });
   return {
     sync() {

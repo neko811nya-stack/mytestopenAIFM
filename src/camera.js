@@ -3,6 +3,8 @@
 //   lock   — fly freely, but the view stays aimed at the target
 //   follow — keep a fixed distance / bearing to the target at a fixed altitude (no wave bobbing);
 //            drag or A/D orbits, W/S or the wheel changes distance, Space/Q changes altitude
+//   drive  — chase camera behind the target's heading at a fixed altitude while the keys steer the boat;
+//            drag swings the view around, the wheel changes distance
 // Touch devices feed the same controls through `touch` (virtual stick + up/down buttons).
 export class FlyCamera {
   constructor(canvas, { position = [0, 6, 0], yaw = 0, pitch = 0 } = {}) {
@@ -15,11 +17,12 @@ export class FlyCamera {
     this.velocity = [0, 0, 0];
     this.touch = { x: 0, y: 0, vertical: 0 };
     this.mode = 'free';
-    this.follow = { distance: 30, bearing: 0, altitude: 6 };
+    this.follow = { distance: 30, bearing: 0, altitude: 6, offset: 0 };
     let dragging = false, lx = 0, ly = 0;
     const look = (dx, dy) => {
-      if (this.mode === 'follow') {
-        this.follow.bearing += dx * 0.005;
+      if (this.mode === 'follow' || this.mode === 'drive') {
+        if (this.mode === 'drive') this.follow.offset += dx * 0.005;
+        else this.follow.bearing += dx * 0.005;
         this.follow.altitude = clampAltitude(this.follow.altitude + dy * 0.05 * Math.max(1, this.follow.distance / 30));
       } else if (this.mode === 'free') {
         this.yaw += dx * 0.0025;
@@ -37,7 +40,7 @@ export class FlyCamera {
     canvas.addEventListener('dblclick', () => canvas.requestPointerLock?.());
     canvas.addEventListener('wheel', (e) => {
       e.preventDefault();
-      if (this.mode === 'follow') this.follow.distance = clampDistance(this.follow.distance * Math.exp(e.deltaY * 0.001));
+      if (this.mode === 'follow' || this.mode === 'drive') this.follow.distance = clampDistance(this.follow.distance * Math.exp(e.deltaY * 0.001));
       else this.speed = Math.max(1, Math.min(400, this.speed * Math.exp(-e.deltaY * 0.001)));
     }, { passive: false });
     window.addEventListener('keydown', (e) => {
@@ -53,9 +56,12 @@ export class FlyCamera {
     return [cp * Math.cos(this.yaw), Math.sin(this.pitch), cp * Math.sin(this.yaw)];
   }
 
-  // Switch mode; `target` is the target's current position (needed for lock / follow).
-  setMode(mode, target) {
+  // Switch mode; `target` is the target's current position (needed for lock / follow / drive).
+  setMode(mode, target, heading = 0) {
     if (mode !== 'free' && !target) mode = 'free';
+    if (mode === 'drive') {
+      Object.assign(this.follow, { distance: 22, altitude: target[1] + 5, bearing: heading + Math.PI, offset: 0 });
+    }
     if (mode === 'follow') {
       // start from wherever the camera is now, relative to the target
       const dx = this.position[0] - target[0], dz = this.position[2] - target[2];
@@ -67,16 +73,32 @@ export class FlyCamera {
     this.mode = mode;
   }
 
-  update(dt, target) {
-    if (this.mode !== 'free' && !target) this.mode = 'free';
+  // Movement input from keys and the touch controls: ahead / side / up in -1..1.
+  input() {
     const k = this.keys;
     const axis = (pos, neg) => (pos.some((c) => k.has(c)) ? 1 : 0) - (neg.some((c) => k.has(c)) ? 1 : 0);
-    const ahead = axis(['KeyW', 'ArrowUp'], ['KeyS', 'ArrowDown']) - this.touch.y;
-    const side = axis(['KeyD', 'ArrowRight'], ['KeyA', 'ArrowLeft']) + this.touch.x;
-    const up = axis(['Space', 'KeyE'], ['KeyQ', 'KeyC']) + this.touch.vertical;
-    const boost = k.has('ShiftLeft') || k.has('ShiftRight') ? 5 : 1;
+    const clamp1 = (v) => Math.max(-1, Math.min(1, v));
+    return {
+      ahead: clamp1(axis(['KeyW', 'ArrowUp'], ['KeyS', 'ArrowDown']) - this.touch.y),
+      side: clamp1(axis(['KeyD', 'ArrowRight'], ['KeyA', 'ArrowLeft']) + this.touch.x),
+      up: clamp1(axis(['Space', 'KeyE'], ['KeyQ', 'KeyC']) + this.touch.vertical),
+      boost: k.has('ShiftLeft') || k.has('ShiftRight') ? 5 : 1,
+    };
+  }
 
-    if (this.mode === 'follow') {
+  update(dt, target, heading = 0) {
+    if (this.mode !== 'free' && !target) this.mode = 'free';
+    const { ahead, side, up, boost } = this.input();
+
+    if (this.mode === 'drive') {
+      // swing in behind the bow; the keys belong to the helm, Space/Q still adjust altitude
+      const f = this.follow;
+      const want = heading + Math.PI + f.offset;
+      const diff = Math.atan2(Math.sin(want - f.bearing), Math.cos(want - f.bearing));
+      f.bearing += diff * (1 - Math.exp(-dt * 2.5));
+      f.altitude = clampAltitude(f.altitude + up * dt * this.speed);
+      this.position = [target[0] + Math.cos(f.bearing) * f.distance, f.altitude, target[2] + Math.sin(f.bearing) * f.distance];
+    } else if (this.mode === 'follow') {
       const f = this.follow;
       f.distance = clampDistance(f.distance * Math.exp(-ahead * dt * boost));
       f.bearing += side * dt * 0.8 * boost;

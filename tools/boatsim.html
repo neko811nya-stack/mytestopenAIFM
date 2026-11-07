@@ -7,6 +7,7 @@ import { Sky } from '../src/sky.js';
 import { Boat } from '../src/boat.js';
 const q = new URLSearchParams(location.search);
 const p = (k, d) => (q.has(k) ? +q.get(k) : d);
+const helm = q.has('helm') ? q.get('helm').split(',').map(Number) : null;
 const wind = p('wind', 9), waves = p('waves', 1), mass = p('mass', 3) * 1000, speed = p('speed', 0), seconds = p('seconds', 40);
 const device = await (await navigator.gpu.requestAdapter()).requestDevice();
 const frame = new FrameUniforms(device);
@@ -23,7 +24,7 @@ const rb = device.createBuffer({ size: 128, usage: GPUBufferUsage.COPY_DST | GPU
 for (let i = 0; i < seconds / dt; i++) {
   const enc = device.createCommandEncoder();
   sim.update(enc, 20 + i * dt, dt);
-  boat.update(enc, dt, { enabled: true, windSpeed: wind, mass, speed });
+  boat.update(enc, dt, { enabled: true, windSpeed: wind, mass, speed, helm: helm && { throttle: helm[0], rudder: helm[1] } });
   boat.copied = false;
   if (i % 15 === 0) enc.copyBufferToBuffer(boat.state, 0, rb, 0, 128);
   device.queue.submit([enc.finish()]);
@@ -32,7 +33,7 @@ for (let i = 0; i < seconds / dt; i++) {
     const d = new Float32Array(rb.getMappedRange().slice(0));
     rb.unmap();
     const heel = Math.acos(Math.max(-1, Math.min(1, d[9]))) * 180 / Math.PI;
-    rows.push(`t=${(i * dt).toFixed(1).padStart(5)} y=${d[1].toFixed(2).padStart(6)} heel=${heel.toFixed(0).padStart(3)} flood=${(d[19] * 100).toFixed(0).padStart(3)}% splash=${d[23].toFixed(2)} xz=(${d[0].toFixed(1)},${d[2].toFixed(1)}) v=${d[31].toFixed(2)}`);
+    rows.push(`t=${(i * dt).toFixed(1).padStart(5)} y=${d[1].toFixed(2).padStart(6)} heel=${heel.toFixed(0).padStart(3)} flood=${(d[19] * 100).toFixed(0).padStart(3)}% splash=${d[23].toFixed(2)} xz=(${d[0].toFixed(1)},${d[2].toFixed(1)}) v=${d[31].toFixed(2)} yaw=${(Math.atan2(d[6], d[4]) * 180 / Math.PI).toFixed(0)}`);
   }
 }
 document.body.textContent = rows.join('\n');

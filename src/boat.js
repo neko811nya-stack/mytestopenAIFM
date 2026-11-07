@@ -81,6 +81,7 @@ struct BoatParams {
   base: vec2f, yaw0: f32, dt: f32,
   enabled: f32, windSpeed: f32, mass: f32, speed: f32,
   reset: f32, columns: f32, pad0: f32, pad1: f32,
+  manual: f32, throttle: f32, rudder: f32, pad2: f32,   // player at the helm: throttle / rudder in -1..1
 };
 struct Column { a: vec4f, b: vec4f };  // a = (x, z, bottom y, top y), b.x = horizontal area
 @group(0) @binding(0) var<uniform> P: BoatParams;
@@ -221,21 +222,34 @@ fn main() {
     F += fw;
     T += cross(qrot(q, vec3f(-0.6, 4.8, 0.0)), fw);
 
-    // helm: hold the mooring (speed 0) or sail a big circle
+    // helm: player control, hold the mooring (speed 0) or sail a big circle.
+    // A positive torque about +y turns the bow toward decreasing yaw.
     let yaw = atan2(ax.z, ax.x);
     var targetYaw = P.yaw0;
-    if (P.speed > 0.05) {
+    let fwdFlat = normalize(vec3f(ax.x, 0.0, ax.z) + vec3f(1e-5));
+    let through = dot(vel - meanFlow, fwdFlat);   // speed through the water
+    if (P.manual > 0.5) {
+      // engine: full ahead ~8 kn, astern at 35 %
+      let thrust = select(P.throttle * 0.35, P.throttle, P.throttle > 0.0) * 5200.0;
+      F += fwdFlat * thrust * massScale * upright;
+      // the rudder needs water flowing past it: little bite when stopped, reversed when going astern
+      let bite = clamp(through / 1.5, -1.0, 1.0) * (0.4 + 0.6 * min(abs(through) / 3.0, 1.0)) + 0.15 * P.throttle;
+      T.y += (-P.rudder * bite * 16000.0 - omega.y * 9000.0) * massScale * upright;
+      course = yaw;
+    } else if (P.speed > 0.05) {
       course += P.speed * KNOT / COURSE_RADIUS * h;
       targetYaw = course;
-      let fwd = normalize(vec3f(ax.x, 0.0, ax.z) + vec3f(1e-5));
-      let ahead = dot(vel - meanFlow, fwd);
-      F += fwd * clamp((P.speed * KNOT - ahead) * 3000.0 * massScale, -9000.0, 9000.0) * upright;
+      F += fwdFlat * clamp((P.speed * KNOT - through) * 3000.0 * massScale, -9000.0, 9000.0) * upright;
+      T.y += (wrapAngle(yaw - targetYaw) * 9000.0 - omega.y * 14000.0) * massScale * upright;
     } else {
       course = P.yaw0;
       let off = pos.xz - P.base;
-      F += vec3f(-350.0 * off.x - 900.0 * vel.x, 0.0, -350.0 * off.y - 900.0 * vel.z) * massScale;
+      let pull = -350.0 * off;
+      let pullLen = length(pull);
+      let moor = select(pull, pull * (3500.0 / pullLen), pullLen > 3500.0);  // gentle even when far from the anchor
+      F += vec3f(moor.x - 900.0 * vel.x, 0.0, moor.y - 900.0 * vel.z) * massScale;
+      T.y += (wrapAngle(yaw - targetYaw) * 9000.0 - omega.y * 14000.0) * massScale * upright;
     }
-    T.y += (-wrapAngle(yaw - targetYaw) * 9000.0 - omega.y * 14000.0) * massScale * upright;
 
     // integrate (semi-implicit Euler); inertia rotated into world space
     vel += F / mass * h;
@@ -429,10 +443,11 @@ function normalize3(v) {
 export class Boat {
   constructor(device, sim, sky, frame, hdrFormat, { samples = 4, base = [58, 9], yaw = 125 * Math.PI / 180 } = {}) {
     this.device = device;
-    this.base = base;
+    this.home = { base: [...base], yaw };
+    this.base = [...base];   // mooring point (moves to wherever the player stops steering)
     this.yaw = yaw;
     this.status = { flood: 0, sunk: false, heel: 0, position: null };
-    this.params = device.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.params = device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.state = device.createBuffer({ size: (8 + MAX_COLUMNS) * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
     // small ring of readback buffers so the position reaches the CPU every frame (camera follow)
     this.readbacks = [0, 1, 2].map(() => ({ buffer: device.createBuffer({ size: 128, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ }), busy: false }));
@@ -484,16 +499,25 @@ export class Boat {
   }
 
   respawn() {
+    this.base = [...this.home.base];
+    this.yaw = this.home.yaw;
     this.resetPending = true;
   }
 
-  // opts: { enabled, windSpeed (m/s), mass (kg), speed (knots) }
+  // drop anchor here (used when the player hands back the helm)
+  setAnchor(xz, yaw) {
+    this.base = [xz[0], xz[1]];
+    this.yaw = yaw;
+  }
+
+  // opts: { enabled, windSpeed (m/s), mass (kg), speed (knots), helm: null | { throttle, rudder } }
   update(encoder, dt, opts) {
     this.enabled = opts.enabled;
     this.device.queue.writeBuffer(this.params, 0, new Float32Array([
       this.base[0], this.base[1], this.yaw, dt,
       opts.enabled ? 1 : 0, opts.windSpeed, opts.mass, opts.speed,
       this.resetPending ? 1 : 0, this.columnCount, 0, 0,
+      opts.helm ? 1 : 0, opts.helm?.throttle ?? 0, opts.helm?.rudder ?? 0, 0,
     ]));
     this.resetPending = false;
     const pass = encoder.beginComputePass({ label: 'boat physics' });
@@ -525,7 +549,7 @@ export class Boat {
       // pos (0-2), ay.y (9) = cosine of the tilt, vel.w (19) flooding, misc.y (29) time sunk, misc.w (31) speed
       this.status = {
         flood: d[19], heel: Math.acos(Math.min(1, Math.max(-1, d[9]))) * 180 / Math.PI,
-        sunk: d[1] < -3, speed: d[31], position: [d[0], d[1], d[2]],
+        sunk: d[1] < -3, speed: d[31], position: [d[0], d[1], d[2]], heading: Math.atan2(d[6], d[4]),
       };
     }).catch(() => { rb.busy = false; });
   }
