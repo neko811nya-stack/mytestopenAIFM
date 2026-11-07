@@ -3,6 +3,7 @@
 // fragments rebuild normals from the derivative cascades and shade the water.
 import { FRAME_WGSL, makeLayout, makeBindGroup, VIS } from './common.js';
 import { SKY_SAMPLE_WGSL } from './sky.js';
+import { BOAT_WGSL } from './boat.js';
 
 const OCEAN_WGSL = FRAME_WGSL + /* wgsl */ `
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -15,6 +16,8 @@ const OCEAN_WGSL = FRAME_WGSL + /* wgsl */ `
 @group(0) @binding(7) var noiseTex: texture_2d<f32>;
 @group(0) @binding(8) var noiseSampler: sampler;
 @group(0) @binding(9) var<storage, read> sunVis: array<f32>;
+` + BOAT_WGSL + /* wgsl */ `
+@group(0) @binding(10) var<storage, read> boat: BoatState;
 ` + SKY_SAMPLE_WGSL + /* wgsl */ `
 const CASCADES = 3;
 
@@ -132,7 +135,17 @@ fn smithG1(NdotX: f32, a: f32) -> f32 {
   let cut = 1.0 - saturate(foamRaw * 1.3);
   let aa = max(fwidth(cells) * 1.5, 0.03);
   let crisp = smoothstep(cut - aa, cut + aa, cells) * saturate(foamRaw * 4.0);
-  let foamCov = mix(crisp, saturate(foamRaw * 0.8), saturate(footprint * 1.5 - 0.2));
+  var foamCov = mix(crisp, saturate(foamRaw * 0.8), saturate(footprint * 1.5 - 0.2));
+
+  // -------- boat: churned water hugging the hull, no water inside it
+  var insideHull = false;
+  if (boat.pos.w > 0.5) {
+    let bp = boatLocal(boat, in.rel + frame.camPos);
+    let bd = boatWaterlineDistance(bp);
+    insideHull = bd < -0.04;
+    let lap = saturate(1.0 - bd / 0.9) * (0.45 + 0.55 * cells);
+    foamCov = max(foamCov, smoothstep(0.35, 0.75, lap));
+  }
   let foamLight = (sunCol * saturate(dot(n, L) + 0.1) + ambient) * (0.8 / PI);
   col = mix(col + spec, foamLight, foamCov);
 
@@ -141,6 +154,7 @@ fn smithG1(NdotX: f32, a: f32) -> f32 {
   let fog = 1.0 - exp(-dist / (32000.0 * heightScale()));
   let edge = smoothstep(0.6, 1.0, length(in.xz - frame.camPos.xz) / (frame.meshRadial * heightScale()));
   col = mix(col, hazeCol, max(fog, edge));
+  if (insideHull) { discard; }
   return vec4f(col, 1.0);
 }
 `;
@@ -158,7 +172,7 @@ function solveRings(rings, s0, rMax) {
 }
 
 export class OceanRenderer {
-  constructor(device, sim, sky, frame, hdrFormat, { rings = 512, segments = 512, s0 = 0.08, rMax = 24000, samples = 4 } = {}) {
+  constructor(device, sim, sky, boat, frame, hdrFormat, { rings = 512, segments = 512, s0 = 0.08, rMax = 24000, samples = 4 } = {}) {
     this.device = device;
     // keep the near-camera vertex spacing comparable when the ring count drops
     s0 *= 512 / rings;
@@ -197,11 +211,11 @@ export class OceanRenderer {
     const VF = VIS.VF, F = VIS.F;
     const layout = makeLayout(device, [
       [0, VF, 'uniform'], [1, VF, 'texArray'], [2, F, 'texArray'], [3, VF, 'sampler'], [4, F, 'tex'], [5, F, 'sampler'],
-      [6, F, 'tex'], [7, F, 'tex'], [8, F, 'sampler'], [9, F, 'read'],
+      [6, F, 'tex'], [7, F, 'tex'], [8, F, 'sampler'], [9, F, 'read'], [10, F, 'read'],
     ]);
     this.bindGroup = makeBindGroup(device, layout, [
       frame.buffer, sim.displacementView, sim.derivativesView, this.sampler, sky.envView, sky.skySampler,
-      sky.lutView, sky.noiseView, sky.noiseSampler, sky.sunVis,
+      sky.lutView, sky.noiseView, sky.noiseSampler, sky.sunVis, boat.state,
     ]);
     const module = device.createShaderModule({ code: OCEAN_WGSL, label: 'ocean' });
     this.pipeline = device.createRenderPipeline({

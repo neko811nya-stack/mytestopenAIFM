@@ -3,6 +3,7 @@ import { OceanSimulation } from './ocean.js';
 import { OceanRenderer } from './oceanRender.js';
 import { Sky, sunTransmittance, SUN_ILLUMINANCE } from './sky.js';
 import { Post } from './post.js';
+import { Boat } from './boat.js';
 import { FlyCamera } from './camera.js';
 import { mul, perspectiveReversedInfinite, viewRotation, invert, dirFromAngles } from './math.js';
 
@@ -30,7 +31,7 @@ const list = (k) => (query.has(k) ? query.get(k).split(',').map(Number) : null);
 // Slider defaults (the reset button returns to these). Quality is per device and is not reset.
 const DEFAULTS = {
   windSpeed: 9, windAngle: 200, choppy: 1.15, foam: 1.0, sunElevation: 2, sunAzimuth: 20,
-  clouds: 0.55, exposure: 1.8, timeScale: 1, bloom: 0.05,
+  clouds: 0.55, exposure: 1.8, timeScale: 1, bloom: 0.05, boat: true,
 };
 const DEFAULT_CAMERA = { position: [0, 7, 0], yaw: DEFAULTS.sunAzimuth * deg, pitch: -4 * deg };
 
@@ -45,6 +46,7 @@ const settings = {
   exposure: num('exposure', DEFAULTS.exposure),
   timeScale: num('timeScale', DEFAULTS.timeScale),
   bloom: num('bloom', DEFAULTS.bloom),
+  boat: query.get('boat') !== '0',
   quality: num('q', storedQuality() ?? (isTouch ? 0 : 4)),
 };
 
@@ -83,12 +85,13 @@ async function main() {
   let needsWarmup = true;
   const build = (level) => {
     const q = QUALITY[level];
-    if (gfx) for (const part of [gfx.sim, gfx.sky, gfx.ocean, gfx.post]) part.destroy();
+    if (gfx) for (const part of [gfx.sim, gfx.sky, gfx.boat, gfx.ocean, gfx.post]) part.destroy();
     const sim = new OceanSimulation(device, { N: q.fftN, lengths: [256, 48, 9] });
     const sky = new Sky(device, frame, HDR, q);
-    const ocean = new OceanRenderer(device, sim, sky, frame, HDR, { rings: q.mesh, segments: q.mesh, samples: q.samples });
+    const boat = new Boat(device, sim, sky, frame, HDR, { samples: q.samples });
+    const ocean = new OceanRenderer(device, sim, sky, boat, frame, HDR, { rings: q.mesh, segments: q.mesh, samples: q.samples });
     const post = new Post(device, frame, format, HDR, { samples: q.samples, bloom: q.bloom });
-    gfx = { q, sim, sky, ocean, post };
+    gfx = { q, sim, sky, boat, ocean, post };
     width = height = 0;  // force a resize for the new render targets
     needsWarmup = true;
   };
@@ -130,7 +133,7 @@ async function main() {
 
   const render = (now) => {
     resize();
-    const { sim, sky, ocean, post } = gfx;
+    const { sim, sky, boat, ocean, post } = gfx;
     let dt = Math.min((now - last) / 1000, 0.1);
     last = now;
     fpsAcc += dt; fpsFrames++;
@@ -183,9 +186,11 @@ async function main() {
     }
     const encoder = device.createCommandEncoder();
     sim.update(encoder, simTime, simDt);
+    boat.update(encoder, simDt, settings.boat);
     sky.update(encoder);
     const pass = post.beginScene(encoder);
     ocean.draw(pass);
+    boat.draw(pass);
     sky.draw(pass);
     pass.end();
     post.finish(encoder, context.getCurrentTexture().createView());
@@ -228,12 +233,17 @@ function bindUI(s, onQuality, onReset) {
     });
     show(input);
   }
+  const boatToggle = document.getElementById('boat');
+  boatToggle.checked = s.boat;
+  boatToggle.addEventListener('change', () => { s.boat = boatToggle.checked; });
+
   document.getElementById('reset').addEventListener('click', () => {
     onReset();
     for (const input of sliders) {
       input.value = s[input.dataset.key];
       show(input);
     }
+    boatToggle.checked = s.boat;
   });
 
   const quality = document.getElementById('quality');
