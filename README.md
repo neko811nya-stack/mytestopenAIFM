@@ -18,6 +18,8 @@ python3 -m http.server 8000
 # → http://localhost:8000/
 ```
 
+Windows なら、何もインストールせずに `start.bat` をダブルクリックするだけで起動できます（PowerShell の小さなサーバー `serve.ps1` を使います。git があれば最新版への更新もします）。
+
 ビルド工程も依存パッケージもありません（GitHub Pages などにそのまま置けます）。
 
 ### 新しい機能が出ないとき
