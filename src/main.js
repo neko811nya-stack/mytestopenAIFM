@@ -115,8 +115,19 @@ async function main() {
     camera.yaw = DEFAULT_CAMERA.yaw;
     camera.pitch = DEFAULT_CAMERA.pitch;
     camera.velocity = [0, 0, 0];
+    camera.setMode('free');
   });
   bindTouch(camera);
+
+  // Camera targets: anything with a name and a position (null while unavailable).
+  // The boat is the only one for now; its position comes back from the GPU a frame or two late,
+  // so the camera aims at a smoothed copy (and follows at a fixed altitude, ignoring wave bobbing).
+  const targets = [{
+    name: '船',
+    position: () => (settings.boat ? gfx.boat.status.position : null),  // keep watching while it sinks
+  }];
+  const aim = { target: targets[0], smooth: null };
+  const camButtons = bindCameraModes(camera, () => aim.smooth);
   document.getElementById('respawn').addEventListener('click', () => gfx.boat.respawn());
 
   const resize = () => {
@@ -143,7 +154,16 @@ async function main() {
     last = now;
     fpsAcc += dt; fpsFrames++;
     if (fpsAcc > 0.5) { fpsEl.textContent = `${Math.round(fpsFrames / fpsAcc)} fps`; fpsAcc = 0; fpsFrames = 0; }
-    camera.update(dt);
+    const raw = aim.target.position();
+    if (!raw) aim.smooth = null;
+    else if (!aim.smooth) aim.smooth = [raw[0], raw[1] + 2.5, raw[2]];
+    else {
+      const a = 1 - Math.exp(-dt * 6), ay = 1 - Math.exp(-dt * 1.5);
+      aim.smooth = [aim.smooth[0] + (raw[0] - aim.smooth[0]) * a, aim.smooth[1] + (raw[1] + 2.5 - aim.smooth[1]) * ay, aim.smooth[2] + (raw[2] - aim.smooth[2]) * a];
+    }
+    if (query.has('cammode') && aim.smooth && !aim.started) { aim.started = true; camera.setMode(query.get('cammode'), aim.smooth); }
+    camera.update(dt, aim.smooth);
+    camButtons.sync();
     const simDt = fixedTime !== null ? 1 / 60 : dt * settings.timeScale;
     simTime += simDt;
 
@@ -218,7 +238,7 @@ function bindUI(s, onQuality, onReset) {
   const panel = document.getElementById('panel');
   const gear = document.getElementById('gear');
   if (query.get('ui') === '0') {
-    for (const id of ['panel', 'gear', 'help', 'fps', 'touch']) document.getElementById(id).style.display = 'none';
+    for (const id of ['panel', 'gear', 'help', 'fps', 'touch', 'camModes']) document.getElementById(id).style.display = 'none';
   }
   if (isTouch) document.body.classList.add('touch');
   const setOpen = (open) => {
@@ -277,6 +297,29 @@ function showBoatStatus(st, enabled) {
     : st.heel > 100 ? `転覆！ 浸水 ${Math.round(st.flood * 100)}%`
     : `傾き ${Math.round(st.heel)}° · 浸水 ${Math.round(st.flood * 100)}%`;
   if (el.textContent !== text) el.textContent = text;
+}
+
+function bindCameraModes(camera, getTarget) {
+  const buttons = { lock: document.getElementById('camLock'), follow: document.getElementById('camFollow') };
+  const toggle = (mode) => camera.setMode(camera.mode === mode ? 'free' : mode, getTarget());
+  buttons.lock.addEventListener('click', () => toggle('lock'));
+  buttons.follow.addEventListener('click', () => toggle('follow'));
+  window.addEventListener('keydown', (e) => {
+    if (e.target instanceof HTMLInputElement) return;
+    if (e.code === 'KeyL') toggle('lock');
+    if (e.code === 'KeyF') toggle('follow');
+    if (e.code === 'Escape') camera.setMode('free');
+  });
+  return {
+    sync() {
+      const available = !!getTarget();
+      for (const [mode, b] of Object.entries(buttons)) {
+        const on = camera.mode === mode;
+        if (b.getAttribute('aria-pressed') !== String(on)) b.setAttribute('aria-pressed', String(on));
+        if (b.disabled === available) b.disabled = !available;
+      }
+    },
+  };
 }
 
 function bindTouch(camera) {

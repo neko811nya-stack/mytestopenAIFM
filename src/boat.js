@@ -431,11 +431,12 @@ export class Boat {
     this.device = device;
     this.base = base;
     this.yaw = yaw;
-    this.status = { flood: 0, sunk: false, heel: 0 };
+    this.status = { flood: 0, sunk: false, heel: 0, position: null };
     this.params = device.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.state = device.createBuffer({ size: (8 + MAX_COLUMNS) * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-    this.readback = device.createBuffer({ size: 128, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
-    this.reading = false;
+    // small ring of readback buffers so the position reaches the CPU every frame (camera follow)
+    this.readbacks = [0, 1, 2].map(() => ({ buffer: device.createBuffer({ size: 128, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ }), busy: false }));
+    this.pendingReadback = null;
     this.resetPending = false;
 
     const columns = hullColumns();
@@ -500,26 +501,33 @@ export class Boat {
     pass.setBindGroup(0, this.physBG);
     pass.dispatchWorkgroups(1);
     pass.end();
-    // a few times per second, read back flooding / heel for the status line
-    if (!this.reading && performance.now() - (this.lastRead || 0) > 250) {
-      encoder.copyBufferToBuffer(this.state, 0, this.readback, 0, 128);
-      this.copied = true;
+    // read back position / flooding / heel (arrives a frame or two later)
+    const rb = this.readbacks.find((r) => !r.busy);
+    if (rb) {
+      encoder.copyBufferToBuffer(this.state, 0, rb.buffer, 0, 128);
+      rb.busy = true;
+      this.pendingReadback = rb;
     }
   }
 
   // call after queue.submit
   poll() {
-    if (!this.copied) return;
-    this.copied = false;
-    this.reading = true;
-    this.lastRead = performance.now();
-    this.readback.mapAsync(GPUMapMode.READ).then(() => {
-      const d = new Float32Array(this.readback.getMappedRange().slice(0));
-      this.readback.unmap();
-      // ay.y (index 9) is the cosine of the heel/pitch; pos.y (1); vel.w (19) flood; misc.y (29) sunk time
-      this.status = { flood: d[19], heel: Math.acos(Math.min(1, Math.max(-1, d[9]))) * 180 / Math.PI, sunk: d[1] < -3, speed: d[31] };
-      this.reading = false;
-    }).catch(() => { this.reading = false; });
+    const rb = this.pendingReadback;
+    if (!rb) return;
+    this.pendingReadback = null;
+    const stamp = this.readStamp = (this.readStamp || 0) + 1;
+    rb.buffer.mapAsync(GPUMapMode.READ).then(() => {
+      const d = new Float32Array(rb.buffer.getMappedRange().slice(0));
+      rb.buffer.unmap();
+      rb.busy = false;
+      if (stamp < (this.appliedStamp || 0)) return;  // an older read finished late
+      this.appliedStamp = stamp;
+      // pos (0-2), ay.y (9) = cosine of the tilt, vel.w (19) flooding, misc.y (29) time sunk, misc.w (31) speed
+      this.status = {
+        flood: d[19], heel: Math.acos(Math.min(1, Math.max(-1, d[9]))) * 180 / Math.PI,
+        sunk: d[1] < -3, speed: d[31], position: [d[0], d[1], d[2]],
+      };
+    }).catch(() => { rb.busy = false; });
   }
 
   draw(pass) {
@@ -531,6 +539,6 @@ export class Boat {
   }
 
   destroy() {
-    for (const b of [this.params, this.state, this.readback, this.columns, this.vbo]) b.destroy();
+    for (const b of [this.params, this.state, this.columns, this.vbo, ...this.readbacks.map((r) => r.buffer)]) b.destroy();
   }
 }

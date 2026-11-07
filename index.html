@@ -17,7 +17,11 @@
   #gear { position: fixed; top: calc(12px + env(safe-area-inset-top)); right: calc(12px + env(safe-area-inset-right)); width: 40px; height: 40px;
           border-radius: 50%; color: var(--text); font-size: 20px; line-height: 1; cursor: pointer; padding: 0; display: grid; place-items: center; transition: transform .25s; }
   #gear[aria-expanded="true"] { transform: rotate(60deg); }
-  #fps { position: fixed; top: calc(22px + env(safe-area-inset-top)); right: calc(62px + env(safe-area-inset-right)); color: var(--dim); font-variant-numeric: tabular-nums;
+  #camModes { position: fixed; top: calc(12px + env(safe-area-inset-top)); right: calc(60px + env(safe-area-inset-right)); display: flex; gap: 6px; }
+  #camModes button { height: 40px; padding: 0 12px; border-radius: 20px; color: var(--text); font: inherit; cursor: pointer; white-space: nowrap; }
+  #camModes button[aria-pressed="true"] { background: rgba(255,178,107,0.42); border-color: rgba(255,178,107,0.7); }
+  #camModes button:disabled { opacity: .4; cursor: default; }
+  #fps { position: fixed; top: calc(22px + env(safe-area-inset-top)); left: calc(14px + env(safe-area-inset-left)); color: var(--dim); font-variant-numeric: tabular-nums;
          text-shadow: 0 1px 2px rgba(0,0,0,.6); pointer-events: none; }
 
   #panel { position: fixed; top: calc(60px + env(safe-area-inset-top)); right: calc(12px + env(safe-area-inset-right)); width: 260px; max-height: calc(100dvh - 140px);
@@ -64,6 +68,10 @@
 <canvas id="gfx"></canvas>
 <div id="status">海を準備中…</div>
 <span id="fps"></span>
+<div id="camModes">
+  <button id="camLock" class="glass" aria-pressed="false" title="カメラを船に向けたままにする (L)">🎯 ロック</button>
+  <button id="camFollow" class="glass" aria-pressed="false" title="同じ高度のまま船について行く (F)">🚁 追従</button>
+</div>
 <button id="gear" class="glass" aria-label="設定" aria-expanded="false" aria-controls="panel">⚙️</button>
 <div id="panel" class="glass hidden">
   <div class="quality">
@@ -90,9 +98,9 @@
   <label>ブルーム <input type="range" data-key="bloom" min="0" max="0.3" step="0.01"><output></output></label>
   <label>時間速度 <input type="range" data-key="timeScale" min="0" max="3" step="0.05"><output></output></label>
   <button id="reset" type="button">↺ デフォルトに戻す</button>
-  <div class="version">v4 · 船の物理</div>
+  <div class="version">v5 · カメラ追従</div>
 </div>
-<div id="help" class="glass"><b>WASD</b> 移動 · <b>Space/E</b> 上昇 · <b>Q/C</b> 下降 · <b>Shift</b> 加速 · <b>ドラッグ</b> 視点 · <b>ダブルクリック</b> マウスロック · <b>ホイール</b> 速度 · <b>H</b> 設定</div>
+<div id="help" class="glass"><b>WASD</b> 移動 · <b>Space/E</b> 上昇 · <b>Q/C</b> 下降 · <b>Shift</b> 加速 · <b>ドラッグ</b> 視点 · <b>ダブルクリック</b> マウスロック · <b>ホイール</b> 速度 · <b>L</b> ロック · <b>F</b> 追従 (ドラッグで回り込み・W/S で距離) · <b>Esc</b> 解除 · <b>H</b> 設定</div>
 <div id="touch">
   <div id="stick" class="glass" aria-label="移動"><div id="knob"></div></div>
   <div id="updown">
