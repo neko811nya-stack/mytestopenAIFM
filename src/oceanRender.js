@@ -18,6 +18,8 @@ const OCEAN_WGSL = FRAME_WGSL + /* wgsl */ `
 @group(0) @binding(9) var<storage, read> sunVis: array<f32>;
 ` + BOAT_WGSL + /* wgsl */ `
 @group(0) @binding(10) var<storage, read> boat: BoatState;
+@group(0) @binding(11) var reflTex: texture_2d<f32>;      // the boat, mirrored about the sea (planar reflection)
+@group(0) @binding(12) var clampSampler: sampler;
 ` + SKY_SAMPLE_WGSL + /* wgsl */ `
 const CASCADES = 3;
 
@@ -49,6 +51,22 @@ fn heightScale() -> f32 { return max(1.0, frame.camPos.y / 12.0); }
   o.xz = xz;
   o.height = disp.y;
   return o;
+}
+
+// Rain drops: expanding rings in a jittered grid; returns a horizontal normal perturbation.
+fn rippleLayer(xz: vec2f, cell: f32, t: f32, seed: f32) -> vec2f {
+  let g = xz / cell;
+  let c = floor(g);
+  let h = fract(sin(vec2f(dot(c, vec2f(127.1, 311.7)), dot(c, vec2f(269.5, 183.3))) + seed) * 43758.5453);
+  let ph = fract(t * 1.3 + h.x);
+  let d = g - (c + 0.25 + 0.5 * h);
+  let r = length(d);
+  let x = (r - ph * 0.5) * 14.0;
+  let wave = sin(x * 3.0) * exp(-x * x) * (1.0 - ph) * (1.0 - ph);
+  return select(vec2f(0.0), d / r * wave, r > 1e-4);
+}
+fn rainRipples(xz: vec2f, t: f32) -> vec2f {
+  return (rippleLayer(xz, 0.6, t, 0.0) + rippleLayer(xz + vec2f(0.31, 0.17), 0.37, t * 1.17, 3.1)) * 0.35;
 }
 
 fn ggx(NdotH: f32, a: f32) -> f32 {
@@ -83,24 +101,33 @@ fn smithG1(NdotX: f32, a: f32) -> f32 {
   let dist = length(in.rel);
   let V = -in.rel / dist;
   var n = normalize(vec3f(-hx / max(1.0 + jxx, 0.25), 1.0, -hz / max(1.0 + jzz, 0.25)));
+  if (frame.rain > 0.0) {
+    let rip = rainRipples(in.xz, frame.time) * frame.rain * (1.0 - smoothstep(15.0, 70.0, dist));
+    n = normalize(n + vec3f(rip.x, 0.0, rip.y));
+  }
   // Far away, the filtered normal is smoother than the real surface: keep it but widen the lobe below.
   let NdotV0 = dot(n, V);
   if (NdotV0 < 0.02) { n = normalize(n + V * (0.02 - NdotV0)); }
   let NdotV = max(dot(n, V), 1e-3);
 
-  let L = frame.sunDir;
+  // key light: the sun, or the moon at night (its glitter road comes from the same highlight)
+  let L = frame.keyDir;
   let sunVisible = sunVis[0];
-  let sunCol = frame.sunColor * sunVisible;
-  let ambient = skyIrradiance();
+  let sunCol = frame.keyColor * sunVisible;
+  let ambient = skyIrradiance() + vec3f(0.6, 0.65, 0.85) * frame.lightning * 0.8;
 
   // Unresolved slope variance grows with the pixel footprint (glitter road widens with distance).
   let footprint = length(fwidth(in.xz));
-  let rough = clamp(0.045 + 0.06 * log2(1.0 + footprint * 1.5), 0.045, 0.38);
+  let rough = clamp(0.045 + 0.06 * log2(1.0 + footprint * 1.5) + frame.rain * 0.03, 0.045, 0.38);
 
   // -------- reflection
   var R = reflect(-V, n);
   R.y = abs(R.y);
-  let refl = textureSampleLevel(envTex, skySampler, envUV(normalize(R)), 0.0).rgb;
+  var refl = textureSampleLevel(envTex, skySampler, envUV(normalize(R)), 0.0).rgb;
+  // the boat mirrored in the water, wobbled by the waves
+  let suv = in.pos.xy / frame.resolution + vec2f(n.x, n.z) * 0.035;
+  let mirrored = textureSampleLevel(reflTex, clampSampler, suv, 0.0);
+  refl = mix(refl, mirrored.rgb, mirrored.a * (1.0 - saturate(rough * 3.0 - 0.3)));
   let F = 0.02 + 0.98 * pow(1.0 - NdotV, 5.0) * mix(1.0, 0.55, saturate(rough * 2.5));
 
   // -------- sun specular (GGX)
@@ -163,8 +190,11 @@ fn smithG1(NdotX: f32, a: f32) -> f32 {
   col = mix(col + spec, foamLight, foamCov);
 
   // -------- aerial perspective toward the horizon
-  let hazeCol = sampleSky(normalize(vec3f(-V.x, 0.015, -V.z)));
-  let fog = 1.0 - exp(-dist / (32000.0 * heightScale()));
+  // under a grey sky the sea turns slate grey rather than summer blue
+  let l = dot(col, vec3f(0.2126, 0.7152, 0.0722));
+  col = mix(col, l * vec3f(0.85, 0.92, 0.95), frame.overcast * 0.5);
+  let hazeCol = mix(sampleSky(normalize(vec3f(-V.x, 0.015, -V.z))), weatherFog(), frame.overcast);
+  let fog = 1.0 - exp(-dist / (frame.fogDistance * heightScale()));
   let edge = smoothstep(0.6, 1.0, length(in.xz - frame.camPos.xz) / (frame.meshRadial * heightScale()));
   col = mix(col, hazeCol, max(fog, edge));
   if (insideHull) { discard; }
@@ -224,12 +254,17 @@ export class OceanRenderer {
     const VF = VIS.VF, F = VIS.F;
     const layout = makeLayout(device, [
       [0, VF, 'uniform'], [1, VF, 'texArray'], [2, F, 'texArray'], [3, VF, 'sampler'], [4, F, 'tex'], [5, F, 'sampler'],
-      [6, F, 'tex'], [7, F, 'tex'], [8, F, 'sampler'], [9, F, 'read'], [10, F, 'read'],
+      [6, F, 'tex'], [7, F, 'tex'], [8, F, 'sampler'], [9, F, 'read'], [10, F, 'read'], [11, F, 'tex'], [12, F, 'sampler'],
     ]);
-    this.bindGroup = makeBindGroup(device, layout, [
+    this.layout = layout;
+    this.resources = [
       frame.buffer, sim.displacementView, sim.derivativesView, this.sampler, sky.envView, sky.skySampler,
       sky.lutView, sky.noiseView, sky.noiseSampler, sky.sunVis, boat.state,
-    ]);
+    ];
+    this.clampSampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
+    // until the first resize: an empty 1x1 reflection
+    this.emptyReflection = device.createTexture({ size: [1, 1], format: hdrFormat, usage: GPUTextureUsage.TEXTURE_BINDING });
+    this.setReflection(this.emptyReflection.createView());
     const module = device.createShaderModule({ code: OCEAN_WGSL, label: 'ocean' });
     this.pipeline = device.createRenderPipeline({
       label: 'ocean',
@@ -242,9 +277,14 @@ export class OceanRenderer {
     });
   }
 
+  setReflection(view) {
+    this.bindGroup = makeBindGroup(this.device, this.layout, [...this.resources, view, this.clampSampler]);
+  }
+
   destroy() {
     this.vbo.destroy();
     this.ibo.destroy();
+    this.emptyReflection.destroy();
   }
 
   draw(pass) {

@@ -1,6 +1,6 @@
 // Shared WGSL declarations and small WebGPU helpers.
 
-// Per-frame uniforms shared by every render/compute pass (256 bytes).
+// Per-frame uniforms shared by every render/compute pass (352 bytes).
 export const FRAME_WGSL = /* wgsl */ `
 struct Frame {
   viewProj: mat4x4f,
@@ -13,13 +13,19 @@ struct Frame {
   windDir: vec2f, foamAmount: f32, sunDiskScale: f32,
   meshA: f32, meshB: f32, meshRadial: f32, meshAngular: f32,
   waterColor: vec3f, bloomStrength: f32,
+  moonDir: vec3f, moonIllum: f32,       // moonIllum: lit fraction of the disk (phase)
+  moonColor: vec3f, stars: f32,         // moonColor: moonlight reaching the sea; stars: sidereal rotation angle
+  keyDir: vec3f, rain: f32,             // key light = the sun, or the moon at night
+  keyColor: vec3f, snow: f32,
+  lightningPos: vec3f, lightning: f32,  // flash position (world) and intensity
+  overcast: f32, fogDistance: f32, night: f32, pad1: f32,
 };
 const PI = 3.14159265358979;
 fn saturate(x: f32) -> f32 { return clamp(x, 0.0, 1.0); }
 fn ign(p: vec2f) -> f32 { return fract(52.9829189 * fract(dot(p, vec2f(0.06711056, 0.00583715)))); }
 `;
 
-export const FRAME_FLOATS = 64;
+export const FRAME_FLOATS = 88;
 
 export class FrameUniforms {
   constructor(device) {
@@ -39,6 +45,8 @@ FrameUniforms.offsets = {
   viewProj: 0, invViewProj: 16, camPos: 32, time: 35, sunDir: 36, exposure: 39, sunColor: 40, cloudCoverage: 43,
   resolution: 44, cloudTime: 46, frameIndex: 47, cascadeL: 48, windDir: 52, foamAmount: 54, sunDiskScale: 55,
   meshA: 56, meshB: 57, meshRadial: 58, meshAngular: 59, waterColor: 60, bloomStrength: 63,
+  moonDir: 64, moonIllum: 67, moonColor: 68, stars: 71, keyDir: 72, rain: 75, keyColor: 76, snow: 79,
+  lightningPos: 80, lightning: 83, overcast: 84, fogDistance: 85, night: 86,
 };
 
 // Compact explicit bind group layouts: [binding, visibility, kind, extra]

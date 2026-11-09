@@ -296,25 +296,38 @@ struct VSOut {
   @location(0) rel: vec3f,
   @location(1) normal: vec3f,
   @location(2) color: vec4f,
+  @location(3) worldY: f32,
 };
-@vertex fn vs(@location(0) p: vec3f, @location(1) n: vec3f, @location(2) color: vec4f) -> VSOut {
+fn place(p: vec3f, n: vec3f, color: vec4f, mirror: bool) -> VSOut {
   let m = mat3x3f(boat.ax.xyz, boat.ay.xyz, boat.az.xyz);
+  var w = boat.pos.xyz + m * p;
+  var nw = m * n;
   var o: VSOut;
-  o.rel = boat.pos.xyz + m * p - frame.camPos;
+  o.worldY = w.y;
+  // reflection pass: mirror the boat about the mean sea level
+  if (mirror) { w.y = -w.y; nw.y = -nw.y; }
+  o.rel = w - frame.camPos;
   o.pos = frame.viewProj * vec4f(o.rel, 1.0);
-  o.normal = m * n;
+  o.normal = nw;
   o.color = color;
   return o;
 }
-@fragment fn fs(in: VSOut) -> @location(0) vec4f {
+@vertex fn vs(@location(0) p: vec3f, @location(1) n: vec3f, @location(2) color: vec4f) -> VSOut {
+  return place(p, n, color, false);
+}
+@vertex fn vsMirror(@location(0) p: vec3f, @location(1) n: vec3f, @location(2) color: vec4f) -> VSOut {
+  return place(p, n, color, true);
+}
+fn shade(in: VSOut) -> vec3f {
   let dist = length(in.rel);
   let V = -in.rel / dist;
   var n = normalize(in.normal);
   let sail = in.color.a > 0.5;
   if (sail && dot(n, V) < 0.0) { n = -n; }   // sails, boom and stay are single-sided geometry
-  let L = frame.sunDir;
-  let sunCol = frame.sunColor * sunVis[0];
-  let ambient = skyIrradiance();
+  // key light: the sun, or the moon at night; lightning adds a cold flash
+  let L = frame.keyDir;
+  let sunCol = frame.keyColor * sunVis[0];
+  let ambient = skyIrradiance() + vec3f(0.6, 0.65, 0.85) * frame.lightning * 0.8;
   let albedo = in.color.rgb;
 
   // the sunset horizon makes the sky irradiance very bright; the hull and sails occlude half of it
@@ -332,9 +345,16 @@ struct VSOut {
     let spec = pow(saturate(dot(n, H)), 120.0) * 4.0 * saturate(dot(n, L));
     col += F * env * 0.6 + sunCol * spec * 0.05;
   }
-  let hazeCol = sampleSky(normalize(vec3f(-V.x, 0.015, -V.z)));
-  col = mix(col, hazeCol, 1.0 - exp(-dist / 32000.0));
-  return vec4f(col, 1.0);
+  let hazeCol = mix(sampleSky(normalize(vec3f(-V.x, 0.015, -V.z))), weatherFog(), frame.overcast);
+  return mix(col, hazeCol, 1.0 - exp(-dist / frame.fogDistance));
+}
+@fragment fn fs(in: VSOut) -> @location(0) vec4f {
+  return vec4f(shade(in), 1.0);
+}
+// reflection pass: only the part above the sea is reflected; alpha marks where the boat is
+@fragment fn fsMirror(in: VSOut) -> @location(0) vec4f {
+  if (in.worldY < 0.0) { discard; }
+  return vec4f(shade(in), 1.0);
 }
 `;
 
@@ -477,25 +497,25 @@ export class Boat {
     const layout = makeLayout(device, [[0, VF, 'uniform'], [1, VF, 'read'], [2, F, 'tex'], [3, F, 'sampler'], [4, F, 'tex'], [5, F, 'read']]);
     this.bindGroup = makeBindGroup(device, layout, [frame.buffer, this.state, sky.envView, sky.skySampler, sky.lutView, sky.sunVis]);
     const module = device.createShaderModule({ code: RENDER_WGSL, label: 'boat' });
-    this.pipeline = device.createRenderPipeline({
-      label: 'boat',
+    const vertexBuffers = [{
+      arrayStride: 40,
+      attributes: [
+        { shaderLocation: 0, offset: 0, format: 'float32x3' },
+        { shaderLocation: 1, offset: 12, format: 'float32x3' },
+        { shaderLocation: 2, offset: 24, format: 'float32x4' },
+      ],
+    }];
+    const pipe = (label, vs, fs, count) => device.createRenderPipeline({
+      label,
       layout: device.createPipelineLayout({ bindGroupLayouts: [layout] }),
-      vertex: {
-        module, entryPoint: 'vs',
-        buffers: [{
-          arrayStride: 40,
-          attributes: [
-            { shaderLocation: 0, offset: 0, format: 'float32x3' },
-            { shaderLocation: 1, offset: 12, format: 'float32x3' },
-            { shaderLocation: 2, offset: 24, format: 'float32x4' },
-          ],
-        }],
-      },
-      fragment: { module, entryPoint: 'fs', targets: [{ format: hdrFormat }] },
+      vertex: { module, entryPoint: vs, buffers: vertexBuffers },
+      fragment: { module, entryPoint: fs, targets: [{ format: hdrFormat }] },
       primitive: { topology: 'triangle-list', cullMode: 'none' },
       depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'greater' },
-      multisample: { count: samples },
+      multisample: { count },
     });
+    this.pipeline = pipe('boat', 'vs', 'fs', samples);
+    this.mirrorPipeline = pipe('boat reflection', 'vsMirror', 'fsMirror', 1);
   }
 
   respawn() {
@@ -552,6 +572,15 @@ export class Boat {
         sunk: d[1] < -3, speed: d[31], position: [d[0], d[1], d[2]], heading: Math.atan2(d[6], d[4]),
       };
     }).catch(() => { rb.busy = false; });
+  }
+
+  // the mirrored boat for the water reflection (into Post's half-resolution reflection target)
+  drawReflection(pass) {
+    if (!this.enabled) return;
+    pass.setPipeline(this.mirrorPipeline);
+    pass.setBindGroup(0, this.bindGroup);
+    pass.setVertexBuffer(0, this.vbo);
+    pass.draw(this.vertexCount);
   }
 
   draw(pass) {

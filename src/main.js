@@ -1,47 +1,57 @@
 import { FrameUniforms } from './common.js';
 import { OceanSimulation } from './ocean.js';
 import { OceanRenderer } from './oceanRender.js';
-import { Sky, sunTransmittance, SUN_ILLUMINANCE } from './sky.js';
+import { Sky, sunTransmittance, SUN_ILLUMINANCE, MOON_SCALE } from './sky.js';
+import { Weather, WEATHER } from './weather.js';
+import { celestial, moonPhaseName, formatHour, DEFAULT_HOUR } from './celestial.js';
 import { Post } from './post.js';
 import { Boat } from './boat.js';
 import { FlyCamera } from './camera.js';
-import { mul, perspectiveReversedInfinite, viewRotation, invert, dirFromAngles } from './math.js';
+import { mul, perspectiveReversedInfinite, viewRotation, invert } from './math.js';
 
 const HDR = 'rgba16float';
 
 // Quality presets, from phone-friendly (0) to the original desktop quality (4).
 //   pixelRatio: max device pixels per CSS pixel, samples: MSAA, fftN: FFT size per cascade,
 //   mesh: rings = segments of the ocean grid, cloudSteps/lightSteps: cloud ray-march,
-//   envSize/envSteps: reflection environment map
+//   envSize/envSteps: reflection environment map, particles: max rain drops / snowflakes
 const QUALITY = [
-  { name: 'ライト', pixelRatio: 0.75, samples: 1, fftN: 128, mesh: 192, cloudSteps: 16, lightSteps: 2, envSize: [512, 128], envSteps: 8, bloom: false },
-  { name: '低', pixelRatio: 1.0, samples: 1, fftN: 128, mesh: 256, cloudSteps: 22, lightSteps: 3, envSize: [512, 128], envSteps: 10, bloom: true },
-  { name: '中', pixelRatio: 1.0, samples: 4, fftN: 256, mesh: 320, cloudSteps: 26, lightSteps: 3, envSize: [768, 192], envSteps: 14, bloom: true },
-  { name: '高', pixelRatio: 1.25, samples: 4, fftN: 256, mesh: 448, cloudSteps: 34, lightSteps: 4, envSize: [1024, 256], envSteps: 18, bloom: true },
-  { name: '最高', pixelRatio: 1.5, samples: 4, fftN: 256, mesh: 512, cloudSteps: 40, lightSteps: 4, envSize: [1024, 256], envSteps: 18, bloom: true },
+  { name: 'ライト', pixelRatio: 0.75, samples: 1, fftN: 128, mesh: 192, cloudSteps: 16, lightSteps: 2, envSize: [512, 128], envSteps: 8, bloom: false, particles: 2500 },
+  { name: '低', pixelRatio: 1.0, samples: 1, fftN: 128, mesh: 256, cloudSteps: 22, lightSteps: 3, envSize: [512, 128], envSteps: 10, bloom: true, particles: 4000 },
+  { name: '中', pixelRatio: 1.0, samples: 4, fftN: 256, mesh: 320, cloudSteps: 26, lightSteps: 3, envSize: [768, 192], envSteps: 14, bloom: true, particles: 6000 },
+  { name: '高', pixelRatio: 1.25, samples: 4, fftN: 256, mesh: 448, cloudSteps: 34, lightSteps: 4, envSize: [1024, 256], envSteps: 18, bloom: true, particles: 8000 },
+  { name: '最高', pixelRatio: 1.5, samples: 4, fftN: 256, mesh: 512, cloudSteps: 40, lightSteps: 4, envSize: [1024, 256], envSteps: 18, bloom: true, particles: 10000 },
+];
+// 時の流れ: game seconds per real second
+const TIME_FLOW = [
+  { name: '停止', rate: 0 }, { name: '実時間', rate: 1 }, { name: '×60', rate: 60 }, { name: '×300', rate: 300 }, { name: '×1200', rate: 1200 },
 ];
 const isTouch = matchMedia('(pointer: coarse)').matches;
+// Auto exposure is relative to the light of the default sunset, so that view keeps the exposure slider as is.
+const REF_LIGHT = sunTransmittance(celestial(DEFAULT_HOUR, 0).sunDir)[1] * SUN_ILLUMINANCE;
 const deg = Math.PI / 180;
 
-// URL parameters make screenshots reproducible: ?t=12&cam=x,y,z,yawDeg,pitchDeg&sun=elev,azim&ui=0
+// URL parameters make screenshots reproducible: ?t=12&cam=x,y,z,yawDeg,pitchDeg&hour=21.5&moon=14&weather=storm&ui=0
 const query = new URLSearchParams(location.search);
 const num = (k, d) => (query.has(k) ? parseFloat(query.get(k)) : d);
 const list = (k) => (query.has(k) ? query.get(k).split(',').map(Number) : null);
 
 // Slider defaults (the reset button returns to these). Quality is per device and is not reset.
 const DEFAULTS = {
-  windSpeed: 9, windAngle: 200, choppy: 1.15, foam: 1.0, sunElevation: 2, sunAzimuth: 20,
+  windSpeed: 9, windAngle: 200, choppy: 1.15, foam: 1.0, hour: DEFAULT_HOUR, timeFlow: 0, moonAge: 14.8, weather: 'clear',
   clouds: 0.55, exposure: 1.8, timeScale: 1, bloom: 0.05, boat: true, waveHeight: 1, boatMass: 3, boatSpeed: 0,
 };
-const DEFAULT_CAMERA = { position: [0, 7, 0], yaw: DEFAULTS.sunAzimuth * deg, pitch: -4 * deg };
+const DEFAULT_CAMERA = { position: [0, 7, 0], yaw: 20 * deg, pitch: -4 * deg };
 
 const settings = {
   windSpeed: num('wind', DEFAULTS.windSpeed),
   windAngle: num('windDir', DEFAULTS.windAngle),
   choppy: num('choppy', DEFAULTS.choppy),
   foam: num('foam', DEFAULTS.foam),
-  sunElevation: list('sun')?.[0] ?? DEFAULTS.sunElevation,
-  sunAzimuth: list('sun')?.[1] ?? DEFAULTS.sunAzimuth,
+  hour: num('hour', DEFAULTS.hour),
+  timeFlow: num('flow', DEFAULTS.timeFlow),
+  moonAge: num('moon', DEFAULTS.moonAge),
+  weather: WEATHER[query.get('weather')] ? query.get('weather') : DEFAULTS.weather,
   clouds: num('clouds', DEFAULTS.clouds),
   exposure: num('exposure', DEFAULTS.exposure),
   timeScale: num('timeScale', DEFAULTS.timeScale),
@@ -88,13 +98,22 @@ async function main() {
   let needsWarmup = true;
   const build = (level) => {
     const q = QUALITY[level];
-    if (gfx) for (const part of [gfx.sim, gfx.sky, gfx.boat, gfx.ocean, gfx.post]) part.destroy();
+    const weatherState = gfx?.weather.state;
+    if (gfx) for (const part of [gfx.sim, gfx.sky, gfx.boat, gfx.ocean, gfx.post, gfx.weather]) part.destroy();
     const sim = new OceanSimulation(device, { N: q.fftN, lengths: [256, 48, 9] });
     const sky = new Sky(device, frame, HDR, q);
     const boat = new Boat(device, sim, sky, frame, HDR, { samples: q.samples });
     const ocean = new OceanRenderer(device, sim, sky, boat, frame, HDR, { rings: q.mesh, segments: q.mesh, samples: q.samples });
     const post = new Post(device, frame, format, HDR, { samples: q.samples, bloom: q.bloom });
-    gfx = { q, sim, sky, boat, ocean, post };
+    const weather = new Weather(device, sky, frame, HDR, { samples: q.samples, particles: q.particles });
+    if (weatherState) Object.assign(weather.state, weatherState);   // keep the current weather through a rebuild
+    else {
+      // first start: begin in the chosen weather instead of fading in
+      const w = WEATHER[settings.weather];
+      Object.assign(weather.state, { overcast: w.overcast, rain: w.rain, snow: w.snow, thunder: w.thunder });
+    }
+    if (query.has('flash')) weather.debugFlash = num('flash', 1);   // screenshots: hold a lightning strike
+    gfx = { q, sim, sky, boat, ocean, post, weather };
     width = height = 0;  // force a resize for the new render targets
     needsWarmup = true;
   };
@@ -103,13 +122,14 @@ async function main() {
   const cam = list('cam');
   const camera = new FlyCamera(canvas, cam
     ? { position: cam.slice(0, 3), yaw: cam[3] * deg, pitch: cam[4] * deg }
-    : { ...DEFAULT_CAMERA, yaw: settings.sunAzimuth * deg });
+    : { ...DEFAULT_CAMERA });
 
   bindUI(settings, (level) => {
     try { localStorage.setItem('ocean.quality', level); } catch { /* storage may be unavailable */ }
     build(level);
   }, () => {
     Object.assign(settings, DEFAULTS);
+    timeUI.sync();
     gfx.boat.respawn();
     camera.position = [...DEFAULT_CAMERA.position];
     camera.yaw = DEFAULT_CAMERA.yaw;
@@ -118,6 +138,7 @@ async function main() {
     camera.setMode('free');
   });
   bindTouch(camera);
+  const timeUI = bindTimeAndWeather(settings);
 
   // Camera targets: anything with a name and a position (null while unavailable).
   // The boat is the only one for now; its position comes back from the GPU a frame or two late,
@@ -138,6 +159,7 @@ async function main() {
     width = canvas.width = w;
     height = canvas.height = h;
     gfx.post.resize(w, h);
+    gfx.ocean.setReflection(gfx.post.reflectionView);
   };
 
   const fixedTime = query.has('t') ? num('t', 0) : null;
@@ -149,7 +171,7 @@ async function main() {
 
   const render = (now) => {
     resize();
-    const { sim, sky, boat, ocean, post } = gfx;
+    const { sim, sky, boat, ocean, post, weather } = gfx;
     let dt = Math.min((now - last) / 1000, 0.1);
     last = now;
     fpsAcc += dt; fpsFrames++;
@@ -172,8 +194,26 @@ async function main() {
       windSpeed: settings.windSpeed, windAngle: settings.windAngle * deg, choppy: settings.choppy,
       // bigger seas: scaled up geometrically, plus a little extra steepness so they can swamp a boat
       scale: settings.waveHeight, amplitude: Math.pow(settings.waveHeight, 0.6) });
-    const sunDir = dirFromAngles(settings.sunElevation * deg, settings.sunAzimuth * deg);
-    const T = sunTransmittance(sunDir);
+    // ---- time of day, sun, moon
+    const flow = TIME_FLOW[settings.timeFlow]?.rate ?? 0;
+    if (flow > 0) {
+      settings.hour = (settings.hour + dt * flow / 3600) % 24;
+      timeUI.sync();
+    }
+    const sky0 = celestial(settings.hour, settings.moonAge);
+    const sunColor = sunTransmittance(sky0.sunDir).map((t) => t * SUN_ILLUMINANCE);
+    const moonColor = sunTransmittance(sky0.moonDir).map((t) => t * SUN_ILLUMINANCE * MOON_SCALE);
+    const moonLight = moonColor.map((c) => c * sky0.moonIllum);
+    // key light: whichever of the sun and the moon is brighter right now
+    const sunKey = sunColor[1] >= moonLight[1];
+    const wx = weather.update(dt, settings.weather, camera);
+    // auto exposure: daylight from the sun (with a twilight fall-off) plus moonlight, dimmed by cloud
+    const el = sky0.sunElevation;
+    const daylight = el > 2 ? Math.max(sunColor[1], REF_LIGHT) : REF_LIGHT * Math.pow(10, (el - 2) / 3.5);
+    const level = (daylight + moonLight[1] * 1.0 + 0.003) * wx.dimming;
+    const autoExposure = Math.pow(Math.min(Math.max(REF_LIGHT / level, 0.6), 3000), 0.8);
+    // how "night" it looks: drives the blue, desaturated night vision in the tonemapper
+    const nightness = Math.min(1, Math.max(0, Math.log10(REF_LIGHT / Math.max(daylight, 1e-6)) / 2.5));
     // portrait screens: widen the vertical FOV so the horizontal view stays at least ~50 degrees
     const aspect = width / height;
     const fovY = Math.min(85 * deg, Math.max(camera.fov, 2 * Math.atan(Math.tan(25 * deg) / aspect)));
@@ -183,9 +223,23 @@ async function main() {
     frame.set('invViewProj', invert(viewProj));
     frame.set('camPos', camera.position);
     frame.set('time', simTime);
-    frame.set('sunDir', sunDir);
-    frame.set('exposure', settings.exposure);
-    frame.set('sunColor', T.map((t) => t * SUN_ILLUMINANCE));
+    frame.set('sunDir', sky0.sunDir);
+    frame.set('exposure', settings.exposure * autoExposure);
+    frame.set('sunColor', sunColor);
+    frame.set('moonDir', sky0.moonDir);
+    frame.set('moonIllum', sky0.moonIllum);
+    frame.set('moonColor', moonColor);
+    frame.set('stars', sky0.starAngle);
+    frame.set('keyDir', sunKey ? sky0.sunDir : sky0.moonDir);
+    frame.set('keyColor', sunKey ? sunColor : moonLight);
+    frame.set('rain', wx.rain);
+    frame.set('snow', wx.snow);
+    frame.set('overcast', wx.overcast);
+    frame.set('fogDistance', wx.fogDistance);
+    // a flash is bright relative to the scene: scale it against the auto exposure so a night strike doesn't white out
+    frame.set('lightning', wx.lightning * 0.7 / autoExposure);
+    frame.set('lightningPos', wx.lightningPos);
+    frame.set('night', nightness);
     frame.set('cloudCoverage', settings.clouds);
     frame.set('resolution', [width, height]);
     frame.set('cloudTime', simTime);
@@ -222,10 +276,14 @@ async function main() {
       helm: driving ? { throttle: input.ahead, rudder: input.side } : null,
     });
     sky.update(encoder);
+    const reflectionPass = post.beginReflection(encoder);
+    boat.drawReflection(reflectionPass);
+    reflectionPass.end();
     const pass = post.beginScene(encoder);
     ocean.draw(pass);
     boat.draw(pass);
     sky.draw(pass);
+    weather.draw(pass);
     pass.end();
     post.finish(encoder, context.getCurrentTexture().createView());
     device.queue.submit([encoder.finish()]);
@@ -259,7 +317,7 @@ function bindUI(s, onQuality, onReset) {
   const sliders = [...panel.querySelectorAll('input[data-key]')];
   const show = (input) => {
     const out = input.parentElement.querySelector('output');
-    if (out) out.textContent = (+input.value).toFixed(input.step < 1 ? 2 : 0);
+    if (out) out.textContent = formatSlider(input);
   };
   for (const input of sliders) {
     input.value = s[input.dataset.key];
@@ -293,6 +351,38 @@ function bindUI(s, onQuality, onReset) {
     s.quality = +quality.value;
     onQuality(s.quality);
   });
+}
+
+// Slider read-outs: plain numbers, or a clock / moon phase / time-flow name.
+function formatSlider(input) {
+  const v = +input.value;
+  switch (input.dataset.format) {
+    case 'hour': return formatHour(v);
+    case 'flow': return TIME_FLOW[v]?.name ?? '';
+    case 'moon': return moonPhaseName(v);
+    default: return v.toFixed(input.step < 1 ? 2 : 0);
+  }
+}
+
+// The weather buttons, and keeping the clock slider in step while time flows.
+function bindTimeAndWeather(s) {
+  const buttons = [...document.querySelectorAll('#weather button')];
+  const hour = document.querySelector('input[data-key="hour"]');
+  const sync = () => {
+    for (const b of buttons) b.setAttribute('aria-pressed', String(b.dataset.weather === s.weather));
+    // throttle DOM writes while time flows
+    const now = performance.now();
+    if (now - (sync.last || 0) > 150 || Math.abs(+hour.value - s.hour) > 0.5) {
+      sync.last = now;
+      hour.value = s.hour;
+      hour.parentElement.querySelector('output').textContent = formatHour(s.hour);
+    }
+  };
+  for (const b of buttons) {
+    b.addEventListener('click', () => { s.weather = b.dataset.weather; sync(); });
+  }
+  sync();
+  return { sync };
 }
 
 function showBoatStatus(st, enabled, driving) {

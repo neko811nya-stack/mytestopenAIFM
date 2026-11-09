@@ -3,6 +3,9 @@
 import { FRAME_WGSL, makeLayout, makeBindGroup, computePipeline, VIS } from './common.js';
 
 export const SUN_ILLUMINANCE = 20.0;
+// Moonlight relative to sunlight. The real full moon is ~1/400000 of the sun; this is an artistic
+// value that, with the night auto-exposure, keeps moonlit scenes readable but clearly night.
+export const MOON_SCALE = 1 / 700;
 
 // ---------------------------------------------------------------- WGSL
 export const ATMOSPHERE_WGSL = /* wgsl */ `
@@ -13,6 +16,7 @@ const MIE_SCAT = 3.996e-6;
 const MIE_EXT = 8.396e-6;
 const OZONE_ABS = vec3f(0.650e-6, 1.881e-6, 0.085e-6);
 const SUN_ILLUMINANCE = ${SUN_ILLUMINANCE.toFixed(2)};
+const MOON_SCALE = ${MOON_SCALE.toExponential(6)};
 const VIEW_HEIGHT = 30.0;
 
 fn raySphere(ro: vec3f, rd: vec3f, r: f32) -> vec2f {
@@ -74,7 +78,7 @@ fn skyMarch(rdIn: vec3f, L: vec3f) -> vec3f {
     acc += T * (scat - scat * stepT) / max(ext, vec3f(1e-12));
     T *= stepT;
   }
-  return acc * SUN_ILLUMINANCE;
+  return acc;   // per unit of illuminance from L
 }
 `;
 
@@ -100,6 +104,12 @@ fn skyIrradiance() -> vec3f {
     s += sampleSky(normalize(vec3f(cos(a), 0.45, sin(a)))) * 1.2;
   }
   return s / 8.2 * PI;
+}
+// Grey distance fog for rain and snow, built from the sky's own light.
+fn weatherFog() -> vec3f {
+  let a = skyIrradiance() / PI;
+  let l = dot(a, vec3f(0.3, 0.5, 0.2));
+  return mix(a, vec3f(l) * vec3f(0.85, 0.9, 1.0), frame.overcast) * mix(1.0, 0.75, frame.overcast);
 }
 // Equirect environment over the upper hemisphere.
 fn envUV(d: vec3f) -> vec2f {
@@ -132,7 +142,8 @@ fn cloudDensity(p: vec3f, detail: bool, lod: f32) -> f32 {
   let q = p.xz + wind;
   // the deck thins out toward the horizon, leaving a clear band for the setting sun
   let far = length(p.xz - frame.camPos.xz);
-  let cov = frame.cloudCoverage * (1.0 - 0.75 * smoothstep(18000.0, 60000.0, far));
+  let thinning = 0.75 * (1.0 - frame.overcast) * smoothstep(18000.0, 60000.0, far);
+  let cov = mix(frame.cloudCoverage, 0.98, frame.overcast) * (1.0 - thinning);
   // Dome-shaped threshold: only the densest part of the coverage map reaches the top of the slab.
   let base = cloudShape(q * CLOUD_SCALE, lod);
   let rise = smoothstep(0.0, 0.08, h);
@@ -161,10 +172,11 @@ fn marchClouds(ro: vec3f, rd: vec3f, steps: i32, jitter: f32, pixelAngle: f32, a
   if (t0 > maxDist) { return vec4f(0.0, 0.0, 0.0, 1.0); }
   let tEnd = min(t1, maxDist);
   let dt = (tEnd - t0) / f32(steps);
-  let L = frame.sunDir;
+  let L = frame.keyDir;
   let mu = dot(rd, L);
   let phase = mix(hg(mu, 0.72), hg(mu, -0.2), 0.35) + hg(mu, 0.95) * 0.25;
-  let sunCol = frame.sunColor * 1.25;
+  let sunCol = frame.keyColor * 1.25;
+  let density = 1.0 + frame.overcast * 1.5;   // storm decks are thick and dark
   // cool skylight from above for the shadowed sides, warmer bounce near the base
   let skyAmb = mix(sampleSky(vec3f(0.0, 1.0, 0.0)) * PI, ambient, 0.35);
   var T = 1.0;
@@ -175,7 +187,7 @@ fn marchClouds(ro: vec3f, rd: vec3f, steps: i32, jitter: f32, pixelAngle: f32, a
   for (var i = 0; i < steps; i++) {
     let p = ro + rd * t;
     let lod = max(0.0, log2(t * pixelAngle / rd.y * 0.5 * CLOUD_SCALE * 512.0));
-    let d = cloudDensity(p, true, lod);
+    let d = cloudDensity(p, true, lod) * density;
     if (d > 0.002) {
       var od = 0.0;
       var lt = 0.0;
@@ -189,7 +201,12 @@ fn marchClouds(ro: vec3f, rd: vec3f, steps: i32, jitter: f32, pixelAngle: f32, a
       let ms = exp(-od * CLOUD_SIGMA * 0.22) * 0.55;
       let powder = 1.0 - exp(-d * 6.0);
       let h = saturate((p.y - CLOUD_BOTTOM) / (CLOUD_TOP - CLOUD_BOTTOM));
-      let lum = sunCol * (beer * phase + ms * 0.08) * mix(0.45, 1.0, powder) + skyAmb * (0.22 + 0.4 * h) / PI;
+      var lum = sunCol * (beer * phase + ms * 0.08) * mix(0.45, 1.0, powder) + skyAmb * (0.22 + 0.4 * h) / PI;
+      if (frame.lightning > 0.0) {
+        // a lightning stroke lights the cloud from inside, fading over a few kilometres
+        let r = length(p - frame.lightningPos);
+        lum += vec3f(0.75, 0.8, 1.0) * frame.lightning * 6.0 * exp(-r / 2500.0) * (0.35 + 0.65 * (1.0 - h));
+      }
       let stepT = exp(-d * CLOUD_SIGMA * dt);
       S += T * lum * (1.0 - stepT);
       tWeighted += t * T * (1.0 - stepT);
@@ -232,7 +249,13 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   let size = textureDimensions(lutOut);
   if (id.x >= size.x || id.y >= size.y) { return; }
   let uv = (vec2f(id.xy) + 0.5) / vec2f(size);
-  let c = skyMarch(skyDir(uv), frame.sunDir);
+  let d = skyDir(uv);
+  var c = skyMarch(d, frame.sunDir) * SUN_ILLUMINANCE;
+  // moonlit sky: the same scattering lit by the moon (only when it is up and not new)
+  let moonI = SUN_ILLUMINANCE * MOON_SCALE * frame.moonIllum;
+  if (frame.moonDir.y > -0.1 && moonI > 1e-6) { c += skyMarch(d, frame.moonDir) * moonI; }
+  // faint airglow so a moonless night is not pitch black
+  c += vec3f(0.6, 0.8, 1.6) * 2.5e-5 * (0.6 + 0.4 * (1.0 - saturate(d.y)));
   textureStore(lutOut, id.xy, vec4f(c, 1.0));
 }
 `;
@@ -247,7 +270,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   let ambient = skyIrradiance();
   if (id.x == 0u && id.y == 0u) {
     // how much of the sun disk is blocked by clouds (drives the sun glitter on the water)
-    let c = marchClouds(frame.camPos, frame.sunDir, 16, 0.5, 0.0, ambient, vec3f(0.0));
+    let c = marchClouds(frame.camPos, frame.keyDir, 16, 0.5, 0.0, ambient, vec3f(0.0));
     sunVis[0] = c.a;
   }
   if (id.x >= size.x || id.y >= size.y) { return; }
@@ -284,15 +307,97 @@ fn sunDisk(rd: vec3f) -> vec3f {
   let limb = pow(max(1.0 - r * r, 0.0), 0.35);
   return frame.sunColor * frame.sunDiskScale * mix(0.35, 1.0, limb);
 }
+fn hash33(p: vec3f) -> vec3f {
+  var q = vec3u(vec3i(p) + vec3i(1 << 20));
+  q = q * vec3u(1664525u, 1013904223u, 2654435761u);
+  q.x += q.y * q.z; q.y += q.z * q.x; q.z += q.x * q.y;
+  q ^= q >> vec3u(16u);
+  q.x += q.y * q.z; q.y += q.z * q.x; q.z += q.x * q.y;
+  return vec3f(q) / 4294967295.0;
+}
+// rotate v about a unit axis
+fn rotateAxis(v: vec3f, axis: vec3f, a: f32) -> vec3f {
+  return v * cos(a) + cross(axis, v) * sin(a) + axis * dot(axis, v) * (1.0 - cos(a));
+}
+// One layer of point stars: one candidate star per cell of a grid wrapped around the sphere.
+fn starLayer(d: vec3f, cells: f32, px: f32, seed: f32, rarity: f32) -> vec3f {
+  let g = d * cells;
+  let c = floor(g);
+  let h = hash33(c + vec3f(seed));
+  let star = c + 0.2 + 0.6 * h;
+  let dist = length(g - star) / cells;
+  let size = max(px * 0.8, 2e-4);
+  let mag = pow(h.x, rarity);
+  // blue-white to orange
+  let tint = mix(vec3f(1.0, 0.72, 0.45), vec3f(0.75, 0.85, 1.0), h.y);
+  let twinkle = 0.7 + 0.3 * sin(frame.time * (2.0 + h.z * 5.0) + h.y * 40.0);
+  return tint * mag * twinkle * exp(-dist * dist / (size * size)) * (2e-4 / size) * (2e-4 / size);
+}
+fn starfield(rd: vec3f, px: f32) -> vec3f {
+  // the sky turns about a tilted pole (latitude ~35 degrees)
+  let pole = normalize(vec3f(-0.47, 0.57, -0.67));
+  let d = rotateAxis(rd, pole, -frame.stars);
+  // Milky Way: a band around a great circle with clumps and a dark dust lane
+  let gal = normalize(vec3f(0.35, -0.4, 0.85));
+  let b = dot(d, gal);
+  let lon = atan2(d.z, d.x);
+  // sampled in 3D by direction, so the structure is not stretched around the sphere
+  let n = textureSampleLevel(noise3D, noiseSampler, d * 0.9, 0.0);
+  let n2 = textureSampleLevel(noise3D, noiseSampler, d * 2.7 + vec3f(0.3, 0.1, 0.7), 0.0);
+  // star clouds: clumpy, grainy brightness concentrated along the plane
+  let clumps = smoothstep(0.35, 0.75, n.r * 0.6 + n2.g * 0.4) * (0.6 + 0.4 * n2.b);
+  let band = exp(-b * b * 30.0) * (0.2 + clumps);
+  let lane = 1.0 - 0.8 * exp(-pow((b - 0.025 * sin(lon * 3.0)) * 22.0, 2.0)) * smoothstep(0.4, 0.6, n2.r);
+  var c = vec3f(0.92, 0.9, 1.0) * band * lane * 0.00028;
+  c += starLayer(d, 90.0, px, 1.0, 9.0) * 0.16;
+  c += starLayer(d, 210.0, px, 7.0, 14.0) * 0.03;
+  c += starLayer(d, 420.0, px, 13.0, 18.0) * (0.015 + 0.04 * band);
+  return c * smoothstep(0.0, 0.15, rd.y);   // extinction at the horizon
+}
+// The moon: a sphere lit by the sun, so its phase and terminator follow the real geometry.
+fn moonDisk(rd: vec3f) -> vec3f {
+  let M = frame.moonDir;
+  let radius = 0.015;  // ~3.3x the real moon so the phase reads at a glance
+  let cosR = cos(radius);
+  let mu = dot(rd, M);
+  if (mu < cos(radius * 4.0)) { return vec3f(0.0); }
+  let ang = acos(clamp(mu, -1.0, 1.0));
+  // narrow glow from forward scattering in the air
+  var c = frame.moonColor * frame.moonIllum * exp(-(ang - radius) * 400.0) * 0.12 * f32(mu < cosR);
+  if (mu >= cosR) {
+    let t1 = normalize(cross(M, vec3f(0.0, 1.0, 0.0)));
+    let t2 = cross(t1, M);
+    let p = vec2f(dot(rd, t1), dot(rd, t2)) / radius;
+    let n = t1 * p.x + t2 * p.y - M * sqrt(max(1.0 - dot(p, p), 0.0));   // visible hemisphere faces us
+    let lit = saturate(dot(n, frame.sunDir) * 1.5 + 0.02);
+    let maria = textureSampleLevel(noiseTex, noiseSampler, p * 0.22 + vec2f(0.31, 0.62), 0.0);
+    let albedo = 0.75 - 0.32 * smoothstep(0.45, 0.65, maria.r) - 0.1 * maria.a;
+    let edge = 1.0 - smoothstep(0.92, 1.0, length(p));
+    // surface brightness held at a readable on-screen level (not blown out by the night exposure),
+    // so the terminator and the maria stay visible
+    let surface = min(frame.moonColor * 900.0, vec3f(2.2 / frame.exposure) * normalize(frame.moonColor + vec3f(1e-6)) * 1.7);
+    c = surface * albedo * (lit + 0.004) * edge;   // + faint earthshine
+  }
+  return c;
+}
 @fragment fn fs(in: VSOut) -> @location(0) vec4f {
   let w = frame.invViewProj * vec4f(in.ndc, 1.0, 1.0);
   let rd = normalize(w.xyz / w.w);
+  let px = length(fwidth(rd));
   var col = sampleSky(rd);
-  if (rd.y > -0.02) { col += sunDisk(rd) * smoothstep(-0.02, 0.0, rd.y); }
+  if (rd.y > -0.02) {
+    let above = smoothstep(-0.02, 0.0, rd.y);
+    col += (sunDisk(rd) + moonDisk(rd)) * above;
+    col += starfield(rd, px);
+  }
   let ambient = skyIrradiance();
   let haze = sampleSky(normalize(vec3f(rd.x, 0.02, rd.z)));
-  let c = marchClouds(frame.camPos, rd, CLOUD_STEPS, ign(in.pos.xy), 0.75 * length(fwidth(rd)), ambient, haze);
+  let c = marchClouds(frame.camPos, rd, CLOUD_STEPS, ign(in.pos.xy), 0.75 * px, ambient, haze);
   col = col * c.a + c.rgb;
+  // rain / snow: the horizon disappears into grey
+  let fogAmt = frame.overcast * (1.0 - smoothstep(0.0, 0.35, max(rd.y, 0.0))) * 0.9;
+  col = mix(col, weatherFog(), fogAmt);
+  col += vec3f(0.6, 0.65, 0.85) * frame.lightning * 0.015;   // the whole sky flickers with the flash
   return vec4f(col, 1.0);
 }
 `;

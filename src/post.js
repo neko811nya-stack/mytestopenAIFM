@@ -84,6 +84,9 @@ fn toSrgb(c: vec3f) -> vec3f {
   let c = textureSample(hdr, samp, in.uv).rgb;
   let b = textureSample(bloom, samp, in.uv).rgb;
   var x = mix(c, b, frame.bloomStrength) * frame.exposure;
+  // night vision: colours fade and shift blue in the dark (Purkinje effect)
+  let lum = dot(x, vec3f(0.2126, 0.7152, 0.0722));
+  x = mix(x, lum * vec3f(0.62, 0.78, 1.15), frame.night * 0.65);
   // gentle vignette
   let q = in.uv - 0.5;
   x *= 1.0 - dot(q, q) * 0.35;
@@ -139,6 +142,12 @@ export class Post {
     this.levels = Math.max(1, Math.min(6, Math.floor(Math.log2(Math.min(bw, bh))) - 1));
     this.bloom = d.createTexture({ size: [bw, bh], format: this.hdrFormat, mipLevelCount: this.levels, usage: RA | TB });
     this.msaaView = this.msaa?.createView();
+    // half-resolution planar reflection target (the boat mirrored about the sea)
+    const rw = Math.max(1, width >> 1), rh = Math.max(1, height >> 1);
+    this.reflection = d.createTexture({ size: [rw, rh], format: this.hdrFormat, usage: RA | TB });
+    this.reflectionDepth = d.createTexture({ size: [rw, rh], format: 'depth32float', usage: RA });
+    this.reflectionView = this.reflection.createView();
+    this.reflectionDepthView = this.reflectionDepth.createView();
     this.depthView = this.depth.createView();
     this.hdrView = this.hdr.createView();
     this.bloomMips = [...Array(this.levels)].map((_, l) => this.bloom.createView({ baseMipLevel: l, mipLevelCount: 1 }));
@@ -149,7 +158,15 @@ export class Post {
   }
 
   destroy() {
-    for (const t of [this.msaa, this.depth, this.hdr, this.bloom]) t?.destroy();
+    for (const t of [this.msaa, this.depth, this.hdr, this.bloom, this.reflection, this.reflectionDepth]) t?.destroy();
+  }
+
+  beginReflection(encoder) {
+    return encoder.beginRenderPass({
+      label: 'reflection',
+      colorAttachments: [{ view: this.reflectionView, loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 0] }],
+      depthStencilAttachment: { view: this.reflectionDepthView, depthLoadOp: 'clear', depthStoreOp: 'discard', depthClearValue: 0 },
+    });
   }
 
   beginScene(encoder) {
