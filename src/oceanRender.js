@@ -53,8 +53,9 @@ fn heightScale() -> f32 { return max(1.0, frame.camPos.y / 12.0); }
   return o;
 }
 
-// Rain drops: expanding rings in a jittered grid; returns a horizontal normal perturbation.
-fn rippleLayer(xz: vec2f, cell: f32, t: f32, seed: f32) -> vec2f {
+// Rain drops: expanding rings in a jittered grid.
+// Returns a horizontal normal perturbation (xy) and how bright the ring crest is (z).
+fn rippleLayer(xz: vec2f, cell: f32, t: f32, seed: f32) -> vec3f {
   let g = xz / cell;
   let c = floor(g);
   let h = fract(sin(vec2f(dot(c, vec2f(127.1, 311.7)), dot(c, vec2f(269.5, 183.3))) + seed) * 43758.5453);
@@ -63,10 +64,10 @@ fn rippleLayer(xz: vec2f, cell: f32, t: f32, seed: f32) -> vec2f {
   let r = length(d);
   let x = (r - ph * 0.5) * 14.0;
   let wave = sin(x * 3.0) * exp(-x * x) * (1.0 - ph) * (1.0 - ph);
-  return select(vec2f(0.0), d / r * wave, r > 1e-4);
+  return vec3f(select(vec2f(0.0), d / r * wave, r > 1e-4), abs(wave));
 }
-fn rainRipples(xz: vec2f, t: f32) -> vec2f {
-  return (rippleLayer(xz, 0.6, t, 0.0) + rippleLayer(xz + vec2f(0.31, 0.17), 0.37, t * 1.17, 3.1)) * 0.35;
+fn rainRipples(xz: vec2f, t: f32) -> vec3f {
+  return rippleLayer(xz, 0.9, t, 0.0) + rippleLayer(xz + vec2f(0.31, 0.17), 0.55, t * 1.17, 3.1) * 0.8;
 }
 
 fn ggx(NdotH: f32, a: f32) -> f32 {
@@ -101,9 +102,11 @@ fn smithG1(NdotX: f32, a: f32) -> f32 {
   let dist = length(in.rel);
   let V = -in.rel / dist;
   var n = normalize(vec3f(-hx / max(1.0 + jxx, 0.25), 1.0, -hz / max(1.0 + jzz, 0.25)));
+  var ripple = 0.0;
   if (frame.rain > 0.0) {
-    let rip = rainRipples(in.xz, frame.time) * frame.rain * (1.0 - smoothstep(15.0, 70.0, dist));
-    n = normalize(n + vec3f(rip.x, 0.0, rip.y));
+    let rip = rainRipples(in.xz, frame.time) * frame.rain * (1.0 - smoothstep(12.0, 60.0, dist));
+    n = normalize(n + vec3f(rip.x, 0.0, rip.y) * 0.9);
+    ripple = rip.z;
   }
   // Far away, the filtered normal is smoother than the real surface: keep it but widen the lobe below.
   let NdotV0 = dot(n, V);
@@ -127,7 +130,9 @@ fn smithG1(NdotX: f32, a: f32) -> f32 {
   // the boat mirrored in the water, wobbled by the waves
   let suv = in.pos.xy / frame.resolution + vec2f(n.x, n.z) * 0.035;
   let mirrored = textureSampleLevel(reflTex, clampSampler, suv, 0.0);
-  refl = mix(refl, mirrored.rgb, mirrored.a * (1.0 - saturate(rough * 3.0 - 0.3)));
+  // 映り込み slider: 0 hides the boat's reflection, 1 is natural, 2 makes it bold even on rough water
+  let mirrorAmount = saturate(mirrored.a * frame.reflection * (1.0 - saturate(rough * 3.0 - 0.3) / max(frame.reflection, 1.0)));
+  refl = mix(refl, mirrored.rgb, mirrorAmount);
   let F = 0.02 + 0.98 * pow(1.0 - NdotV, 5.0) * mix(1.0, 0.55, saturate(rough * 2.5));
 
   // -------- sun specular (GGX)
@@ -151,6 +156,11 @@ fn smithG1(NdotX: f32, a: f32) -> f32 {
   let sss = sssColor * sunCol * (crest * crest) * toward * pow(saturate(0.5 - 0.5 * dot(L, n)), 2.0) * 0.6
           + sssColor * ambient * crest * 0.035;
   var col = (1.0 - F) * (body + sss) + F * refl;
+  // above 1 the 映り込み slider goes beyond physics: blend the mirrored boat in directly,
+  // so it shows even where the water reflects only a few percent (looking steeply down)
+  col = mix(col, mirrored.rgb, saturate(mirrorAmount * (frame.reflection - 1.0) * 0.6));
+  // ring crests catch the grey sky light, so the drops read even on a flat, overcast sea
+  col += ambient * ripple * 0.05;
 
   // -------- whitecaps
   // persistent foam (decays slowly in the simulation, leaving trails) + instantaneous crest foam from the combined Jacobian

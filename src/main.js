@@ -39,7 +39,7 @@ const list = (k) => (query.has(k) ? query.get(k).split(',').map(Number) : null);
 // Slider defaults (the reset button returns to these). Quality is per device and is not reset.
 const DEFAULTS = {
   windSpeed: 9, windAngle: 200, choppy: 1.15, foam: 1.0, hour: DEFAULT_HOUR, timeFlow: 0, moonAge: 14.8, weather: 'clear',
-  clouds: 0.55, exposure: 1.8, timeScale: 1, bloom: 0.05, boat: true, waveHeight: 1, boatMass: 3, boatSpeed: 0,
+  clouds: 0.55, exposure: 1.8, autoExposure: 1, reflection: 1, timeScale: 1, bloom: 0.05, boat: true, waveHeight: 1, boatMass: 3, boatSpeed: 0,
 };
 const DEFAULT_CAMERA = { position: [0, 7, 0], yaw: 20 * deg, pitch: -4 * deg };
 
@@ -54,6 +54,8 @@ const settings = {
   weather: WEATHER[query.get('weather')] ? query.get('weather') : DEFAULTS.weather,
   clouds: num('clouds', DEFAULTS.clouds),
   exposure: num('exposure', DEFAULTS.exposure),
+  autoExposure: num('auto', DEFAULTS.autoExposure),
+  reflection: num('reflection', DEFAULTS.reflection),
   timeScale: num('timeScale', DEFAULTS.timeScale),
   bloom: num('bloom', DEFAULTS.bloom),
   boat: query.get('boat') !== '0',
@@ -211,7 +213,8 @@ async function main() {
     const el = sky0.sunElevation;
     const daylight = el > 2 ? Math.max(sunColor[1], REF_LIGHT) : REF_LIGHT * Math.pow(10, (el - 2) / 3.5);
     const level = (daylight + moonLight[1] * 1.0 + 0.003) * wx.dimming;
-    const autoExposure = Math.pow(Math.min(Math.max(REF_LIGHT / level, 0.6), 3000), 0.8);
+    // 露出オート: 0 = fixed exposure, 1 = full adaptation, above 1 = adapts even harder (in log space)
+    const autoExposure = Math.pow(Math.min(Math.max(REF_LIGHT / level, 0.6), 3000), 0.8 * settings.autoExposure);
     // how "night" it looks: drives the blue, desaturated night vision in the tonemapper
     const nightness = Math.min(1, Math.max(0, Math.log10(REF_LIGHT / Math.max(daylight, 1e-6)) / 2.5));
     // portrait screens: widen the vertical FOV so the horizontal view stays at least ~50 degrees
@@ -240,6 +243,7 @@ async function main() {
     frame.set('lightning', wx.lightning * 0.7 / autoExposure);
     frame.set('lightningPos', wx.lightningPos);
     frame.set('night', nightness);
+    frame.set('reflection', settings.reflection);
     frame.set('cloudCoverage', settings.clouds);
     frame.set('resolution', [width, height]);
     frame.set('cloudTime', simTime);
@@ -360,6 +364,7 @@ function formatSlider(input) {
     case 'hour': return formatHour(v);
     case 'flow': return TIME_FLOW[v]?.name ?? '';
     case 'moon': return moonPhaseName(v);
+    case 'auto': return v === 0 ? 'オフ' : v.toFixed(2);
     default: return v.toFixed(input.step < 1 ? 2 : 0);
   }
 }

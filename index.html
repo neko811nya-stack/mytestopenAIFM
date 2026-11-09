@@ -107,10 +107,12 @@
   <label>雲量     <input type="range" data-key="clouds" min="0" max="1" step="0.01"><output></output></label>
   <h2>表示</h2>
   <label>露出     <input type="range" data-key="exposure" min="0.2" max="8" step="0.05"><output></output></label>
+  <label>露出オート <input type="range" data-key="autoExposure" data-format="auto" min="0" max="1.5" step="0.05"><output></output></label>
+  <label>映り込み <input type="range" data-key="reflection" min="0" max="2" step="0.05"><output></output></label>
   <label>ブルーム <input type="range" data-key="bloom" min="0" max="0.3" step="0.01"><output></output></label>
   <label>時間速度 <input type="range" data-key="timeScale" min="0" max="3" step="0.05"><output></output></label>
   <button id="reset" type="button">↺ デフォルトに戻す</button>
-  <div class="version">v7 · 昼夜と天気</div>
+  <div class="version">v8 · 露出オート・映り込み</div>
 </div>
 <div id="helmHud" class="glass" hidden></div>
 <div id="help" class="glass"><b>WASD</b> 移動 · <b>Space/E</b> 上昇 · <b>Q/C</b> 下降 · <b>Shift</b> 加速 · <b>ドラッグ</b> 視点 · <b>ダブルクリック</b> マウスロック · <b>ホイール</b> 速度 · <b>L</b> ロック · <b>F</b> 追従 (ドラッグで回り込み・W/S で距離) · <b>B</b> 操縦 (W/S スロットル・A/D 舵) · <b>Esc</b> 解除 · <b>H</b> 設定</div>

@@ -18,7 +18,7 @@ struct Frame {
   keyDir: vec3f, rain: f32,             // key light = the sun, or the moon at night
   keyColor: vec3f, snow: f32,
   lightningPos: vec3f, lightning: f32,  // flash position (world) and intensity
-  overcast: f32, fogDistance: f32, night: f32, pad1: f32,
+  overcast: f32, fogDistance: f32, night: f32, reflection: f32,
 };
 const PI = 3.14159265358979;
 fn saturate(x: f32) -> f32 { return clamp(x, 0.0, 1.0); }
@@ -46,7 +46,7 @@ FrameUniforms.offsets = {
   resolution: 44, cloudTime: 46, frameIndex: 47, cascadeL: 48, windDir: 52, foamAmount: 54, sunDiskScale: 55,
   meshA: 56, meshB: 57, meshRadial: 58, meshAngular: 59, waterColor: 60, bloomStrength: 63,
   moonDir: 64, moonIllum: 67, moonColor: 68, stars: 71, keyDir: 72, rain: 75, keyColor: 76, snow: 79,
-  lightningPos: 80, lightning: 83, overcast: 84, fogDistance: 85, night: 86,
+  lightningPos: 80, lightning: 83, overcast: 84, fogDistance: 85, night: 86, reflection: 87,
 };
 
 // Compact explicit bind group layouts: [binding, visibility, kind, extra]
